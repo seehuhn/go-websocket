@@ -28,7 +28,8 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	conn := &Conn{}
+	conn := newConn()
+	// TODO(voss): move the handshake into newConn()
 	status, msg := conn.handshake(w, req, handler.AccessOk)
 	if status == http.StatusSwitchingProtocols {
 		w.WriteHeader(status)
@@ -53,4 +54,9 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}(ctx)
 
 	conn.handle(handlerDone, cancel)
+}
+
+type ioResult struct {
+	N   int
+	Err error
 }

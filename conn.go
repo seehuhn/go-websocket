@@ -11,6 +11,17 @@ import (
 	"strings"
 )
 
+type FrameType byte
+
+const (
+	contFrame   FrameType = 0
+	TextFrame   FrameType = 1
+	BinaryFrame FrameType = 2
+	closeFrame  FrameType = 8
+	pingFrame   FrameType = 9
+	pongFrame   FrameType = 10
+)
+
 type Conn struct {
 	ResourceName *url.URL
 	Origin       *url.URL
@@ -18,6 +29,14 @@ type Conn struct {
 
 	conn net.Conn
 	rw   *bufio.ReadWriter
+
+	readMessage <-chan *wsReader
+	getWriter   chan<- *writerSlot
+	sendControl chan<- *controlMsg
+}
+
+func newConn() *Conn {
+	return &Conn{}
 }
 
 func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
@@ -88,109 +107,31 @@ func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
 }
 
 func (conn *Conn) handle(done <-chan struct{}, cancel func()) {
-	rcv := make(chan *frame)
-	go func(rcv chan<- *frame) {
-		conn.readFrames(rcv)
-	}(rcv)
+	rcv := make(chan *wsReader, 1)
+	conn.readMessage = rcv
 
-	isOpen := true
-	for isOpen {
-		select {
-		case frame, ok := <-rcv:
-			if !ok {
-				rcv = nil
-				continue
-			}
-			log.Println(frame)
-		case _, ok := <-done:
-			if !ok {
-				done = nil
-			}
-		}
-	}
+	snd := make(chan *writerSlot, 1)
+	conn.getWriter = snd
+
+	ctl := make(chan *controlMsg)
+	conn.sendControl = ctl
+
+	go conn.writeFrames(snd, ctl)
+
+	conn.readFrames(rcv)
 	log.Println("done")
 }
 
-func (conn *Conn) readFrames(frames chan<- *frame) {
-	buf := make([]byte, 8)
-	for {
-		n, _ := conn.rw.Read(buf[:2])
-		if n < 2 {
-			break
-		}
-
-		fin := buf[0] & 1
-		reserved := (buf[0] >> 1) & 7
-		if reserved != 0 {
-			break
-		}
-		opcode := (buf[0] >> 4) & 15
-
-		mask := buf[1] & 1
-		if mask == 0 {
-			break
-		}
-
-		// read the length
-		l8 := (buf[1] >> 1) & 127
-		lengthBytes := 1
-		if l8 == 127 {
-			lengthBytes = 8
-		} else if l8 == 126 {
-			lengthBytes = 2
-		}
-		if lengthBytes > 1 {
-			n, _ := conn.rw.Read(buf[:lengthBytes])
-			if n < lengthBytes {
-				break
-			}
-		} else {
-			buf[0] = l8
-		}
-		var length uint64
-		for i := 0; i < lengthBytes; i++ {
-			length = length<<8 | uint64(buf[i])
-		}
-
-		// read the masking key
-		n, _ = conn.rw.Read(buf[:4])
-		if n < 4 {
-			break
-		}
-
-		log.Println("read some:", fin, opcode, length, buf[:4])
-	}
-	close(frames)
+type frame struct {
+	Final  bool
+	Opcode FrameType
+	Length uint64
+	Mask   []byte
 }
 
-type opcodeType byte
-
-const (
-	opcodeCont opcodeType = iota
-	opcodeText
-	opcodeBinary
-	opcodeReserved3
-	opcodeReserved4
-	opcodeReserved5
-	opcodeReserved6
-	opcodeReserved7
-	opcodeClose
-	opcodePing
-	opcodePong
-	opcodeReservedB
-	opcodeReservedC
-	opcodeReservedD
-	opcodeReservedE
-	opcodeReservedF
-)
-
-type frame struct {
-	Fin    bool
-	Rsv    byte
-	Opcode opcodeType
-	Masked bool
-	Len    uint64
-	Mask   []byte
+type controlMsg struct {
+	Opcode FrameType
+	Body   []byte
 }
 
 func getAccept(key string) string {

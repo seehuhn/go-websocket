@@ -8,6 +8,8 @@ test.hello = function() {
   test.ws.addEventListener('open', function (event) {
     console.log(test.ws.protocol);
     test.ws.send('Hello Server!');
+    test.ws.send('Noptaloo');
+    // test.ws.close(3333, 'morkel');
   });
 
   test.ws.addEventListener('message', function (event) {
