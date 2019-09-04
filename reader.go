@@ -5,7 +5,7 @@ import (
 	"log"
 )
 
-func (conn *Conn) ReadMessage() (FrameType, io.Reader, error) {
+func (conn *Conn) ReceiveMessage() (FrameType, io.Reader, error) {
 	r, ok := <-conn.readMessage
 	if !ok {
 		return 0, nil, io.EOF

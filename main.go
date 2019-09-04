@@ -25,17 +25,12 @@ func checkAccess(conn *websocket.Conn, protocols []string) bool {
 
 func handle(conn *websocket.Conn) {
 	for {
-		w, err := conn.WriteMessage(websocket.TextFrame)
+		err := conn.SendText("hello, client!")
 		if err != nil {
 			log.Fatal(err)
 		}
-		_, err = w.Write([]byte("hello, client!"))
-		if err != nil {
-			log.Fatal(err)
-		}
-		w.Close()
 
-		opcode, r, err := conn.ReadMessage()
+		opcode, r, err := conn.ReceiveMessage()
 		if err != nil {
 			log.Fatal(err)
 		}

@@ -4,14 +4,13 @@ import (
 	"io"
 )
 
-func (conn *Conn) WriteMessage(tp FrameType) (io.WriteCloser, error) {
+func (conn *Conn) SendMessage(tp FrameType) (io.WriteCloser, error) {
 	if tp != TextFrame && tp != BinaryFrame {
 		return nil, errFrameType
 	}
 
 	buffers := make(chan []byte, 1)
 	getDone := make(chan (<-chan ioResult))
-
 	conn.getWriter <- &writerSlot{
 		Opcode:  tp,
 		Buffers: buffers,
@@ -26,6 +25,39 @@ func (conn *Conn) WriteMessage(tp FrameType) (io.WriteCloser, error) {
 		Buffers: buffers,
 		Done:    done,
 	}, nil
+}
+
+func (conn *Conn) SendText(msg string) error {
+	return conn.sendData(TextFrame, []byte(msg))
+}
+
+func (conn *Conn) SendBinary(msg []byte) error {
+	return conn.sendData(BinaryFrame, msg)
+}
+
+func (conn *Conn) sendData(opcode FrameType, msg []byte) error {
+	buffers := make(chan []byte, 1)
+	getDone := make(chan (<-chan ioResult))
+	conn.getWriter <- &writerSlot{
+		Opcode:  opcode,
+		Buffers: buffers,
+		GetDone: getDone,
+	}
+	done := <-getDone
+	if done == nil {
+		return ErrConnClosed
+	}
+
+	buffers <- []byte(msg)
+	res1 := <-done
+	close(buffers)
+	res2 := <-done
+
+	err := res1.Err
+	if err == nil {
+		err = res2.Err
+	}
+	return err
 }
 
 type writerSlot struct {
