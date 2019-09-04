@@ -3,7 +3,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -24,21 +23,8 @@ func checkAccess(conn *websocket.Conn, protocols []string) bool {
 	return true
 }
 
-func handle(ctx context.Context, conn *websocket.Conn) {
+func handle(conn *websocket.Conn) {
 	for {
-		opcode, r, err := conn.ReadMessage()
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println("received message type", opcode)
-
-		buf := make([]byte, 256)
-		n, err := r.Read(buf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println("message:", string(buf[:n]))
-
 		w, err := conn.WriteMessage(websocket.TextFrame)
 		if err != nil {
 			log.Fatal(err)
@@ -48,6 +34,18 @@ func handle(ctx context.Context, conn *websocket.Conn) {
 			log.Fatal(err)
 		}
 		w.Close()
+
+		opcode, r, err := conn.ReadMessage()
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("received message type", opcode)
+		buf := make([]byte, 256)
+		n, err := r.Read(buf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("message:", string(buf[:n]))
 	}
 }
 

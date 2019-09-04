@@ -106,7 +106,14 @@ func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	return http.StatusSwitchingProtocols, ""
 }
 
-func (conn *Conn) handle(done <-chan struct{}, cancel func()) {
+func getAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key))
+	h.Write([]byte(websocketGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func (conn *Conn) handle(serverReady chan<- struct{}, userDone <-chan struct{}) {
 	rcv := make(chan *wsReader, 1)
 	conn.readMessage = rcv
 
@@ -116,10 +123,12 @@ func (conn *Conn) handle(done <-chan struct{}, cancel func()) {
 	ctl := make(chan *controlMsg)
 	conn.sendControl = ctl
 
-	go conn.writeFrames(snd, ctl)
+	close(serverReady)
 
+	go conn.writeFrames(snd, ctl)
 	conn.readFrames(rcv)
-	log.Println("done")
+
+	log.Println("server handler done")
 }
 
 type frame struct {
@@ -132,11 +141,4 @@ type frame struct {
 type controlMsg struct {
 	Opcode FrameType
 	Body   []byte
-}
-
-func getAccept(key string) string {
-	h := sha1.New()
-	h.Write([]byte(key))
-	h.Write([]byte(websocketGUID))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }

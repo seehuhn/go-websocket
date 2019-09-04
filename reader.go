@@ -90,6 +90,13 @@ func (conn *Conn) readFrameHeader(buf []byte) (*frame, error) {
 func (conn *Conn) handleControlFrame(opcode FrameType, body []byte) error {
 	switch opcode {
 	case closeFrame:
+		code := 1005
+		msg := ""
+		if len(body) >= 2 {
+			code = 256*int(body[0]) + int(body[1])
+			msg = string(body[2:])
+		}
+		log.Println("CLOSE", code, msg)
 	case pingFrame:
 	case pongFrame:
 	default:

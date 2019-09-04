@@ -1,6 +1,8 @@
 package websocket
 
-import "io"
+import (
+	"io"
+)
 
 func (conn *Conn) WriteMessage(tp FrameType) (io.WriteCloser, error) {
 	if tp != TextFrame && tp != BinaryFrame {
@@ -52,48 +54,58 @@ func (w *wsWriter) Close() error {
 	return res.Err
 }
 
-func (conn *Conn) writeFrameHeader(buf []byte, frame *frame) error {
-	buf[0] = byte(frame.Opcode)
+func (conn *Conn) writeFrame(opcode FrameType, body []byte, final bool) error {
+	var header [10]byte
 
-	if frame.Final {
-		buf[0] |= 128
+	header[0] = byte(opcode)
+	if final {
+		header[0] |= 128
 	}
 
-	l := frame.Length
+	l := uint64(len(body))
 	n := 2
 	if l < 126 {
-		buf[1] = byte(l)
+		header[1] = byte(l)
 	} else if l < (1 << 16) {
-		buf[1] = 126
-		buf[2] = byte(l >> 8)
-		buf[3] = byte(l)
+		header[1] = 126
+		header[2] = byte(l >> 8)
+		header[3] = byte(l)
 		n = 4
 	} else {
-		buf[1] = 127
-		buf[2] = byte(l >> 56)
-		buf[3] = byte(l >> 48)
-		buf[4] = byte(l >> 40)
-		buf[5] = byte(l >> 32)
-		buf[6] = byte(l >> 24)
-		buf[7] = byte(l >> 16)
-		buf[8] = byte(l >> 8)
-		buf[9] = byte(l)
+		header[1] = 127
+		header[2] = byte(l >> 56)
+		header[3] = byte(l >> 48)
+		header[4] = byte(l >> 40)
+		header[5] = byte(l >> 32)
+		header[6] = byte(l >> 24)
+		header[7] = byte(l >> 16)
+		header[8] = byte(l >> 8)
+		header[9] = byte(l)
 		n = 10
 	}
 
-	_, err := conn.rw.Write(buf[:n])
-	return err
+	_, err := conn.rw.Write(header[:n])
+	if err != nil {
+		return err
+	}
+	_, err = conn.rw.Write(body)
+	if err != nil {
+		return err
+	}
+	return conn.rw.Flush()
 }
 
 // writeFrames multiplexes all output to the network.
 func (conn *Conn) writeFrames(data <-chan *writerSlot, ctl <-chan *controlMsg) {
-	headerBuffer := make([]byte, 10)
-
 	done := make(chan ioResult, 1)
 
 	var dataOpcode FrameType
 	var dataBuffersIn <-chan []byte
-	dataBuffer := make([]byte, 0, 16*1024)
+	dataBufferSize := conn.rw.Writer.Size()
+	if dataBufferSize < 512 {
+		dataBufferSize = 512
+	}
+	dataBuffer := make([]byte, dataBufferSize)
 	dataBufferPos := 0
 
 	getWriter := data
@@ -123,23 +135,13 @@ writerLoop:
 				buf = buf[n:]
 
 				final := len(buf) == 0 && !ok
-				if dataBufferPos == len(dataBuffer) || final {
-					frame := &frame{
-						Final:  final,
-						Opcode: dataOpcode,
-						Length: uint64(len(dataBuffer)),
-					}
-					err := conn.writeFrameHeader(headerBuffer, frame)
+				if dataBufferPos == dataBufferSize || final {
+					err := conn.writeFrame(dataOpcode, dataBuffer[:dataBufferPos], final)
 					if err != nil {
 						// TODO(voss): handle the error
 						break writerLoop
 					}
-					_, err = conn.rw.Write(dataBuffer)
-					if err != nil {
-						// TODO(voss): handle the error
-						break writerLoop
-					}
-					conn.rw.Flush()
+					dataBufferPos = 0
 					dataOpcode = contFrame
 				}
 
@@ -153,17 +155,7 @@ writerLoop:
 				getWriter = data
 			}
 		case ctlMsg := <-ctl:
-			frame := &frame{
-				Final:  true,
-				Opcode: ctlMsg.Opcode,
-				Length: uint64(len(ctlMsg.Body)),
-			}
-			err := conn.writeFrameHeader(headerBuffer, frame)
-			if err != nil {
-				// TODO(voss): handle the error
-				break writerLoop
-			}
-			_, err = conn.rw.Write(ctlMsg.Body)
+			err := conn.writeFrame(ctlMsg.Opcode, ctlMsg.Body, true)
 			if err != nil {
 				// TODO(voss): handle the error
 				break writerLoop
