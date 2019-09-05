@@ -2,12 +2,51 @@ package websocket
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 )
 
-func (conn *Conn) ReceiveMessage() (FrameType, io.Reader, error) {
+func (conn *Conn) ReceiveBinary(maxLength int) ([]byte, error) {
+	buf, err := conn.receiveLimited(Binary, maxLength)
+	return buf, err
+}
+
+func (conn *Conn) ReceiveText(maxLength int) (string, error) {
+	buf, err := conn.receiveLimited(Text, maxLength)
+	return string(buf), err
+}
+
+func (conn *Conn) receiveLimited(ex MessageType, maxLength int) ([]byte, error) {
+	tp, r, err := conn.ReceiveMessage()
+	if err != nil {
+		return nil, err
+	}
+
+	res := &bytes.Buffer{}
+	if tp == ex {
+		_, err = io.CopyN(res, r, int64(maxLength))
+	} else {
+		err = ErrMessageType
+	}
+
+	n, e2 := io.Copy(ioutil.Discard, r)
+	if err == nil {
+		if n > 0 {
+			err = ErrTooLarge
+		} else {
+			err = e2
+		}
+	} else if err == io.EOF {
+		err = nil
+	}
+
+	return res.Bytes(), err
+}
+
+func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 	r := <-conn.getDataReader
 	if r == nil {
 		return 0, nil, ErrConnClosed
@@ -53,19 +92,22 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 
 	// read data from the network
 	maxLen := r.Length - r.Pos
-	bufLen64 := uint64(len(buf))
-	if maxLen > bufLen64 {
-		maxLen = bufLen64
-	}
-	n, err = r.rw.Read(buf[:maxLen])
-	offs := int(r.Pos % 4)
-	for i := 0; i < n; i++ {
-		buf[i] ^= r.Mask[(i+offs)%4]
-	}
-	r.Pos += uint64(n)
-	if r.Pos == r.Length && n > 0 {
-		// tell the multiplexer that we have read our allocated share of bytes
-		r.Result <- struct{}{}
+	if maxLen > 0 {
+		bufLen64 := uint64(len(buf))
+		if maxLen > bufLen64 {
+			maxLen = bufLen64
+		}
+
+		n, err = r.rw.Read(buf[:maxLen])
+		offs := int(r.Pos % 4)
+		for i := 0; i < n; i++ {
+			buf[i] ^= r.Mask[(i+offs)%4]
+		}
+		r.Pos += uint64(n)
+		if r.Pos == r.Length {
+			// tell the multiplexer that we have read our allocated share of bytes
+			r.Result <- struct{}{}
+		}
 	}
 
 	if r.Pos == r.Length && r.Final && r.Receive != nil {
@@ -151,7 +193,7 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 
 	return &header{
 		Final:  final != 0,
-		Opcode: FrameType(opcode),
+		Opcode: MessageType(opcode),
 		Length: length,
 		Mask:   buf[:4],
 	}, nil
@@ -184,7 +226,7 @@ func (conn *Conn) readMultiplexer(ready chan<- struct{}) {
 	}
 	drChan <- r
 
-	var code CloseCode = codeUnexpectedCondition
+	status := StatusInternalServerError
 	closeMessage := ""
 	var headerBuf [10]byte
 readLoop:
@@ -192,7 +234,7 @@ readLoop:
 		header, err := conn.readFrameHeader(headerBuf[:])
 		if err != nil {
 			if err == errFrameFormat {
-				code = codeProtocolError
+				status = StatusProtocolError
 			} else {
 				fmt.Printf("READ ERROR: %#v\n", err)
 			}
@@ -200,20 +242,20 @@ readLoop:
 		}
 
 		switch header.Opcode {
-		case TextFrame, BinaryFrame:
+		case Text, Binary:
 			dfChan <- header
 			<-resChan
 		case closeFrame:
 			buf, _ := conn.readFrameBody(header)
 			// we are exiting anyway, so we don't need to check for errors here
 			if len(buf) >= 2 {
-				code = 256*CloseCode(buf[0]) + CloseCode(buf[1])
+				status = 256*Status(buf[0]) + Status(buf[1])
 				closeMessage = string(buf[2:])
 			} else {
-				code = codeMissing
+				status = statusMissing
 				closeMessage = ""
 			}
-			log.Println("CLOSE", code, closeMessage)
+			log.Println("CLOSE", status, closeMessage)
 			break readLoop
 		case pingFrame:
 			buf, err := conn.readFrameBody(header)
@@ -234,7 +276,7 @@ readLoop:
 				break readLoop
 			}
 		default:
-			code = codeProtocolError
+			status = StatusProtocolError
 			closeMessage = fmt.Sprintf("invalid opcode %d", header.Opcode)
 			break readLoop
 		}
@@ -246,6 +288,6 @@ readLoop:
 	// Sending a close response unconditionally is safe,
 	// since the server will ignore everything after it has
 	// sent a close message once.
-	conn.sendCloseFrame(code, closeMessage)
+	conn.sendCloseFrame(status, []byte(closeMessage))
 	log.Println("readers done")
 }

@@ -7,9 +7,11 @@ func (err webSocketError) Error() string {
 }
 
 const (
-	ErrConnClosed = webSocketError("connection closed")
+	ErrConnClosed  = webSocketError("connection closed")
+	ErrMessageType = webSocketError("wrong message type")
+	ErrStatusCode  = webSocketError("invalid status code")
+	ErrTooLarge    = webSocketError("message too large")
 
 	errFrameFormat = webSocketError("invalid frame format")
 	errFrameOpcode = webSocketError("invalid frame opcode")
-	errFrameType   = webSocketError("invalid frame type")
 )

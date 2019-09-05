@@ -4,68 +4,81 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
+// Conn represents a websocket connection initiated by a client.  All
+// fields are read-only.  It is ok to access a Conn from different
+// goroutines concurrently.  The connection must be closed using the
+// Close() method after use, to free all allocated resources.
 type Conn struct {
 	ResourceName *url.URL
 	Origin       *url.URL
 	Protocol     string
 
-	conn net.Conn
-	rw   *bufio.ReadWriter
+	raw net.Conn
+	rw  *bufio.ReadWriter
+
+	readerDone <-chan struct{}
 
 	getDataReader    <-chan *frameReader
 	getDataWriter    <-chan *frameWriter
 	sendControlFrame chan<- *frame
 }
 
-type FrameType byte
+type MessageType byte
 
 const (
-	contFrame   FrameType = 0
-	TextFrame   FrameType = 1
-	BinaryFrame FrameType = 2
-	closeFrame  FrameType = 8
-	pingFrame   FrameType = 9
-	pongFrame   FrameType = 10
+	Text   MessageType = 1
+	Binary MessageType = 2
+
+	contFrame  MessageType = 0
+	closeFrame MessageType = 8
+	pingFrame  MessageType = 9
+	pongFrame  MessageType = 10
 )
 
-type CloseCode uint16
+type Status uint16
 
+// Websocket status codes as defined in RFC 6455
+// See: https://tools.ietf.org/html/rfc6455#section-7.4.1
 const (
-	CodeOK                  CloseCode = 1000
-	codeProtocolError       CloseCode = 1002
-	codeMissing             CloseCode = 1005
-	codeUnexpectedCondition CloseCode = 1011
+	StatusOK                  Status = 1000
+	StatusGoingAway           Status = 1001
+	StatusProtocolError       Status = 1002
+	StatusUnsupportedType     Status = 1003
+	StatusInvalidData         Status = 1007
+	StatusPolicyViolation     Status = 1008
+	StatusTooBig              Status = 1009
+	StatusMissingExtension    Status = 1010
+	StatusInternalServerError Status = 1011
+
+	statusMissing Status = 1005
 )
 
 const (
 	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
-	pingGUID      = "9c5192f2-4504-4cda-b9d4-8ec8e744166a" // locally generated
 )
 
 type header struct {
 	Length uint64
 	Mask   []byte
 	Final  bool
-	Opcode FrameType
+	Opcode MessageType
 }
 
 type frame struct {
 	Body   []byte
 	Final  bool
-	Opcode FrameType
+	Opcode MessageType
 }
 
-func newConn() *Conn {
-	return &Conn{}
-}
-
-func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
+func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	accessOk func(*Conn, []string) bool) (status int, message string) {
 
 	headers := w.Header()
@@ -97,7 +110,7 @@ func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	if err != nil {
 		return http.StatusBadRequest, "invalid Request-URI"
 	}
-	wsc.ResourceName = resourceName
+	conn.ResourceName = resourceName
 
 	var origin *url.URL
 	originString := req.Header.Get("Origin")
@@ -107,7 +120,7 @@ func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
 			return http.StatusBadRequest, "invalid Origin"
 		}
 	}
-	wsc.Origin = origin
+	conn.Origin = origin
 
 	var protocols []string
 	protocol := strings.TrimSpace(req.Header.Get("Sec-Websocket-Protocol"))
@@ -118,35 +131,34 @@ func (wsc *Conn) handshake(w http.ResponseWriter, req *http.Request,
 		}
 	}
 
-	ok := accessOk(wsc, protocols)
-	if !ok {
-		return http.StatusForbidden, "not allowed"
+	if accessOk != nil {
+		ok := accessOk(conn, protocols)
+		if !ok {
+			return http.StatusForbidden, "not allowed"
+		}
 	}
 
-	if wsc.Protocol != "" {
-		headers.Set("Sec-WebSocket-Protocol", wsc.Protocol)
-	}
-	headers.Set("Upgrade", "websocket")
-	headers.Set("Connection", "Upgrade")
-	headers.Set("Sec-WebSocket-Accept", getAccept(key))
-	return http.StatusSwitchingProtocols, ""
-}
-
-func getAccept(key string) string {
 	h := sha1.New()
 	h.Write([]byte(key))
 	h.Write([]byte(websocketGUID))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	if conn.Protocol != "" {
+		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
+	}
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Connection", "Upgrade")
+	headers.Set("Sec-WebSocket-Accept", accept)
+	return http.StatusSwitchingProtocols, ""
 }
 
-func (conn *Conn) sendCloseFrame(code CloseCode, message string) {
-	msg := []byte(message)
+func (conn *Conn) sendCloseFrame(status Status, body []byte) {
 	var buf []byte
-	if code != 0 && code != codeMissing {
-		buf = make([]byte, 2+len(msg))
-		buf[0] = byte(code >> 8)
-		buf[1] = byte(code)
-		copy(buf[2:], msg)
+	if status != 0 && status != statusMissing {
+		buf = make([]byte, 2+len(body))
+		buf[0] = byte(status >> 8)
+		buf[1] = byte(status)
+		copy(buf[2:], body)
 	}
 	ctl := &frame{
 		Opcode: closeFrame,
@@ -154,4 +166,42 @@ func (conn *Conn) sendCloseFrame(code CloseCode, message string) {
 		Final:  true,
 	}
 	conn.sendControlFrame <- ctl
+}
+
+func (conn *Conn) Close(code Status, message string) error {
+	if code < 1000 || code >= 5000 {
+		return ErrStatusCode
+	}
+
+	body := []byte(message)
+	if len(body) > 125-2 {
+		return ErrTooLarge
+	}
+
+	conn.sendCloseFrame(code, body)
+	needsClose := true
+	timeOut := time.NewTimer(3 * time.Second)
+	select {
+	case <-conn.readerDone:
+		if !timeOut.Stop() {
+			<-timeOut.C
+		}
+	case <-timeOut.C:
+		log.Println("client did not send close frame, killing connection")
+		conn.raw.Close()
+		needsClose = false
+	}
+
+	// The reader uses conn.sendControlFrame, so we must be sure the
+	// reader has stopped, before we can close the challer to stop the
+	// writer.
+	<-conn.readerDone
+	close(conn.sendControlFrame)
+
+	log.Println("closing connection")
+	if needsClose {
+		conn.raw.Close()
+	}
+
+	return nil
 }

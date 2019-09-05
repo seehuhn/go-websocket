@@ -9,14 +9,14 @@ import (
 const maxHeaderSize = 10
 
 func (conn *Conn) SendText(msg string) error {
-	return conn.sendData(TextFrame, []byte(msg))
+	return conn.sendData(Text, []byte(msg))
 }
 
 func (conn *Conn) SendBinary(msg []byte) error {
-	return conn.sendData(BinaryFrame, msg)
+	return conn.sendData(Binary, msg)
 }
 
-func (conn *Conn) sendData(opcode FrameType, data []byte) error {
+func (conn *Conn) sendData(opcode MessageType, data []byte) error {
 	// Get the frameWriter just to reserve the data channel, but we
 	// just send the data manually in one frame, rather than using the
 	// Write() method.
@@ -37,9 +37,9 @@ func (conn *Conn) sendData(opcode FrameType, data []byte) error {
 	return err
 }
 
-func (conn *Conn) SendMessage(tp FrameType) (io.WriteCloser, error) {
-	if tp != TextFrame && tp != BinaryFrame {
-		return nil, errFrameType
+func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
+	if tp != Text && tp != Binary {
+		return nil, ErrMessageType
 	}
 	w := <-conn.getDataWriter
 	if w == nil {
@@ -57,7 +57,7 @@ type frameWriter struct {
 	Result <-chan error
 	Done   chan<- *frameWriter
 	Pos    int
-	Opcode FrameType
+	Opcode MessageType
 }
 
 func (w *frameWriter) Write(buf []byte) (total int, err error) {
@@ -101,7 +101,7 @@ func (w *frameWriter) Close() error {
 	return err
 }
 
-func (conn *Conn) writeFrame(opcode FrameType, body []byte, final bool) error {
+func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error {
 	fmt.Println("W", opcode, len(body), map[bool]string{true: "final"}[final])
 
 	var header [maxHeaderSize]byte
