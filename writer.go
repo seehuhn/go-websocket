@@ -1,3 +1,19 @@
+// seehuhn.de/go/websocket - an http server to establish websocket connections
+// Copyright (C) 2019  Jochen Voss <voss@seehuhn.de>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package websocket
 
 import (
@@ -8,10 +24,12 @@ import (
 
 const maxHeaderSize = 10
 
+// SendText sends a text message to the client.
 func (conn *Conn) SendText(msg string) error {
 	return conn.sendData(Text, []byte(msg))
 }
 
+// SendBinary sends a binary message to the client.
 func (conn *Conn) SendBinary(msg []byte) error {
 	return conn.sendData(Binary, msg)
 }
@@ -37,6 +55,10 @@ func (conn *Conn) sendData(opcode MessageType, data []byte) error {
 	return err
 }
 
+// SendMessage starts a new message and returns an io.WriteCloser
+// which can be used to send the message body.  The argument tp gives
+// the message type (Text or Binary).  Text messages must be sent in
+// utf-8 encoded form.
 func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
 	if tp != Text && tp != Binary {
 		return nil, ErrMessageType
@@ -150,7 +172,7 @@ func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error 
 // channels, returning ErrConnClosed for all write attempts, and
 // terminates once conn.sendControlFrame is closed.
 func (conn *Conn) writeMultiplexer(ready chan<- struct{}) {
-	cfChan := make(chan *frame)
+	cfChan := make(chan *frame, 1)
 	conn.sendControlFrame = cfChan
 	dwChan := make(chan *frameWriter, 1)
 	conn.getDataWriter = dwChan

@@ -1,3 +1,19 @@
+// seehuhn.de/go/websocket - an http server to establish websocket connections
+// Copyright (C) 2019  Jochen Voss <voss@seehuhn.de>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package websocket
 
 import (
@@ -9,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +33,8 @@ import (
 // fields are read-only.  It is ok to access a Conn from different
 // goroutines concurrently.  The connection must be closed using the
 // Close() method after use, to free all allocated resources.
+//
+// Use a Handler to obtain Conn objects.
 type Conn struct {
 	ResourceName *url.URL
 	Origin       *url.URL
@@ -29,10 +48,16 @@ type Conn struct {
 	getDataReader    <-chan *frameReader
 	getDataWriter    <-chan *frameWriter
 	sendControlFrame chan<- *frame
+
+	closeMutex sync.Mutex
+	isClosed   bool
 }
 
+// MessageType encodes the type of a websocket message.
 type MessageType byte
 
+// Websocket message types as define in RFC 6455.
+// See: https://tools.ietf.org/html/rfc6455#section-5.6
 const (
 	Text   MessageType = 1
 	Binary MessageType = 2
@@ -43,9 +68,12 @@ const (
 	pongFrame  MessageType = 10
 )
 
+// Status describes the reason for the closure of a websocket
+// connection.
 type Status uint16
 
-// Websocket status codes as defined in RFC 6455
+// Websocket status codes as defined in RFC 6455, for use in the
+// Conn.Close() method.
 // See: https://tools.ietf.org/html/rfc6455#section-7.4.1
 const (
 	StatusOK                  Status = 1000
@@ -54,16 +82,12 @@ const (
 	StatusUnsupportedType     Status = 1003
 	StatusInvalidData         Status = 1007
 	StatusPolicyViolation     Status = 1008
-	StatusTooBig              Status = 1009
-	StatusMissingExtension    Status = 1010
 	StatusInternalServerError Status = 1011
 
 	statusMissing Status = 1005
 )
 
-const (
-	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
-)
+const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
 
 type header struct {
 	Length uint64
@@ -123,11 +147,14 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	conn.Origin = origin
 
 	var protocols []string
-	protocol := strings.TrimSpace(req.Header.Get("Sec-Websocket-Protocol"))
+	protocol := strings.Join(req.Header["Sec-Websocket-Protocol"], ",")
 	if protocol != "" {
 		pp := strings.Split(protocol, ",")
 		for i := 0; i < len(pp); i++ {
-			protocols = append(protocols, strings.TrimSpace(pp[i]))
+			p := strings.TrimSpace(pp[i])
+			if p != "" {
+				protocols = append(protocols, p)
+			}
 		}
 	}
 
@@ -152,7 +179,7 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	return http.StatusSwitchingProtocols, ""
 }
 
-func (conn *Conn) sendCloseFrame(status Status, body []byte) {
+func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 	var buf []byte
 	if status != 0 && status != statusMissing {
 		buf = make([]byte, 2+len(body))
@@ -165,9 +192,27 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) {
 		Body:   buf,
 		Final:  true,
 	}
+
+	conn.closeMutex.Lock()
+	defer conn.closeMutex.Unlock()
+	if conn.isClosed {
+		return ErrConnClosed
+	}
 	conn.sendControlFrame <- ctl
+	return nil
 }
 
+// Close terminates a websocket connection and frees all associated
+// resources.  The connection cannot be used any more after Close()
+// has been called.
+//
+// The status code indicates whether the connection completed
+// successfully, or due to an error.  Use StatusOK for normal
+// termination, and one of the other status codes in case of errors.
+//
+// Message can be used to provide additional information for
+// debugging.  The utf-8 representation of the string must be at most
+// 123 bytes long.
 func (conn *Conn) Close(code Status, message string) error {
 	if code < 1000 || code >= 5000 {
 		return ErrStatusCode
@@ -178,7 +223,11 @@ func (conn *Conn) Close(code Status, message string) error {
 		return ErrTooLarge
 	}
 
-	conn.sendCloseFrame(code, body)
+	err := conn.sendCloseFrame(code, body)
+	if err != nil {
+		return err
+	}
+
 	needsClose := true
 	timeOut := time.NewTimer(3 * time.Second)
 	select {
@@ -196,7 +245,13 @@ func (conn *Conn) Close(code Status, message string) error {
 	// reader has stopped, before we can close the challer to stop the
 	// writer.
 	<-conn.readerDone
-	close(conn.sendControlFrame)
+
+	conn.closeMutex.Lock()
+	if !conn.isClosed {
+		close(conn.sendControlFrame)
+		conn.isClosed = true
+	}
+	conn.closeMutex.Unlock()
 
 	log.Println("closing connection")
 	if needsClose {

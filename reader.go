@@ -1,3 +1,19 @@
+// seehuhn.de/go/websocket - an http server to establish websocket connections
+// Copyright (C) 2019  Jochen Voss <voss@seehuhn.de>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package websocket
 
 import (
@@ -9,11 +25,19 @@ import (
 	"log"
 )
 
+// ReceiveBinary reads a binary message from the connection.  If the
+// next received message is not binary, ErrMessageType is returned.
+// If the length of the message body exceeds maxLength, the data is
+// truncated and ErrTooLarge is returned.
 func (conn *Conn) ReceiveBinary(maxLength int) ([]byte, error) {
 	buf, err := conn.receiveLimited(Binary, maxLength)
 	return buf, err
 }
 
+// ReceiveText reads a text message from the connection.  If the next
+// received message is not a text message, ErrMessageType is returned.
+// If the length of the utf-8 representation of the text exceeds
+// maxLength, the text is truncated and ErrTooLarge is returned.
 func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 	buf, err := conn.receiveLimited(Text, maxLength)
 	return string(buf), err
@@ -46,6 +70,9 @@ func (conn *Conn) receiveLimited(ex MessageType, maxLength int) ([]byte, error) 
 	return res.Bytes(), err
 }
 
+// ReceiveMessage returns an io.Reader which can be used to read the
+// next message from the connection.  The first return value gives the
+// message type received (Text or Binary).
 func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 	r := <-conn.getDataReader
 	if r == nil {
