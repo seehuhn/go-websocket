@@ -20,7 +20,7 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	conn := newConn()
-	// TODO(voss): move the handshake into newConn()
+	// TODO(voss): move the handshake into newConn()?
 	status, msg := conn.handshake(w, req, handler.AccessOk)
 	if status == http.StatusSwitchingProtocols {
 		w.WriteHeader(status)
@@ -28,15 +28,15 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, msg, status)
 		return
 	}
-
+	// TODO(voaa): move this into newConn(), too?
 	raw, rw, err := hijacker.Hijack()
 	if err != nil {
 		panic("Hijack failed: " + err.Error())
 	}
-
-	defer raw.Close()
 	conn.conn = raw
 	conn.rw = rw
+
+	defer raw.Close()
 
 	serverReady := make(chan struct{})
 	userHandlerDone := make(chan struct{})
