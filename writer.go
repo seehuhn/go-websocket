@@ -1,31 +1,12 @@
 package websocket
 
 import (
+	"fmt"
 	"io"
+	"log"
 )
 
-func (conn *Conn) SendMessage(tp FrameType) (io.WriteCloser, error) {
-	if tp != TextFrame && tp != BinaryFrame {
-		return nil, errFrameType
-	}
-
-	buffers := make(chan []byte, 1)
-	getDone := make(chan (<-chan ioResult))
-	conn.getWriter <- &writerSlot{
-		Opcode:  tp,
-		Buffers: buffers,
-		GetDone: getDone,
-	}
-	done := <-getDone
-	if done == nil {
-		return nil, ErrConnClosed
-	}
-
-	return &wsWriter{
-		Buffers: buffers,
-		Done:    done,
-	}, nil
-}
+const maxHeaderSize = 10
 
 func (conn *Conn) SendText(msg string) error {
 	return conn.sendData(TextFrame, []byte(msg))
@@ -35,59 +16,95 @@ func (conn *Conn) SendBinary(msg []byte) error {
 	return conn.sendData(BinaryFrame, msg)
 }
 
-func (conn *Conn) sendData(opcode FrameType, msg []byte) error {
-	buffers := make(chan []byte, 1)
-	getDone := make(chan (<-chan ioResult))
-	conn.getWriter <- &writerSlot{
-		Opcode:  opcode,
-		Buffers: buffers,
-		GetDone: getDone,
-	}
-	done := <-getDone
-	if done == nil {
+func (conn *Conn) sendData(opcode FrameType, data []byte) error {
+	// Get the frameWriter just to reserve the data channel, but we
+	// just send the data manually in one frame, rather than using the
+	// Write() method.
+	w := <-conn.getDataWriter
+	if w == nil {
 		return ErrConnClosed
 	}
 
-	buffers <- []byte(msg)
-	res1 := <-done
-	close(buffers)
-	res2 := <-done
-
-	err := res1.Err
-	if err == nil {
-		err = res2.Err
+	msg := &frame{
+		Opcode: opcode,
+		Body:   data,
+		Final:  true,
 	}
+	w.Send <- msg
+
+	err := <-w.Result
+	w.Done <- w
 	return err
 }
 
-type writerSlot struct {
-	Opcode  FrameType
-	Buffers <-chan []byte
-	GetDone chan<- <-chan ioResult
-}
-
-type wsWriter struct {
-	Buffers chan<- []byte
-	Done    <-chan ioResult
-}
-
-func (w *wsWriter) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
+func (conn *Conn) SendMessage(tp FrameType) (io.WriteCloser, error) {
+	if tp != TextFrame && tp != BinaryFrame {
+		return nil, errFrameType
 	}
-	w.Buffers <- p
-	res := <-w.Done
-	return res.N, res.Err
+	w := <-conn.getDataWriter
+	if w == nil {
+		return nil, ErrConnClosed
+	}
+
+	w.Pos = 0
+	w.Opcode = tp
+	return w, nil
 }
 
-func (w *wsWriter) Close() error {
-	close(w.Buffers)
-	res := <-w.Done
-	return res.Err
+type frameWriter struct {
+	Buffer []byte
+	Send   chan<- *frame
+	Result <-chan error
+	Done   chan<- *frameWriter
+	Pos    int
+	Opcode FrameType
+}
+
+func (w *frameWriter) Write(buf []byte) (total int, err error) {
+	for {
+		n := copy(w.Buffer[w.Pos:], buf)
+		total += n
+		w.Pos += n
+		buf = buf[n:]
+
+		if len(buf) == 0 {
+			return
+		}
+
+		msg := &frame{
+			Opcode: w.Opcode,
+			Body:   w.Buffer,
+			Final:  false,
+		}
+		w.Send <- msg
+
+		w.Pos = 0
+		w.Opcode = contFrame
+
+		err = <-w.Result
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (w *frameWriter) Close() error {
+	msg := &frame{
+		Opcode: w.Opcode,
+		Body:   w.Buffer[:w.Pos],
+		Final:  true,
+	}
+	w.Send <- msg
+
+	err := <-w.Result
+	w.Done <- w // put back the frameWriter for the next user
+	return err
 }
 
 func (conn *Conn) writeFrame(opcode FrameType, body []byte, final bool) error {
-	var header [10]byte
+	fmt.Println("W", opcode, len(body), map[bool]string{true: "final"}[final])
+
+	var header [maxHeaderSize]byte
 
 	header[0] = byte(opcode)
 	if final {
@@ -127,72 +144,64 @@ func (conn *Conn) writeFrame(opcode FrameType, body []byte, final bool) error {
 	return conn.rw.Flush()
 }
 
-// writeFrames multiplexes all output to the network.
-func (conn *Conn) writeFrames(data <-chan *writerSlot, ctl <-chan *controlMsg) {
-	done := make(chan ioResult, 1)
+// writeFrames multiplexes all output to the network channel.
+// Shutdown is initiated by sending a close frame via
+// conn.sendControlFrame.  After this, the function drains all
+// channels, returning ErrConnClosed for all write attempts, and
+// terminates once conn.sendControlFrame is closed.
+func (conn *Conn) writeMultiplexer(ready chan<- struct{}) {
+	cfChan := make(chan *frame)
+	conn.sendControlFrame = cfChan
+	dwChan := make(chan *frameWriter, 1)
+	conn.getDataWriter = dwChan
 
-	var dataOpcode FrameType
-	var dataBuffersIn <-chan []byte
-	dataBufferSize := conn.rw.Writer.Size()
-	if dataBufferSize < 512 {
-		dataBufferSize = 512
+	close(ready)
+
+	dataBufferSize := conn.rw.Writer.Size() - maxHeaderSize
+	if dataBufferSize < 512-maxHeaderSize {
+		dataBufferSize = 512 - maxHeaderSize
 	}
-	dataBuffer := make([]byte, dataBufferSize)
-	dataBufferPos := 0
+	dfChan := make(chan *frame)
+	resChan := make(chan error)
+	w := &frameWriter{
+		Buffer: make([]byte, dataBufferSize),
+		Send:   dfChan,
+		Result: resChan,
+		Done:   dwChan,
+	}
+	dwChan <- w
 
-	getWriter := data
 writerLoop:
 	for {
-		// wait for one of the following:
-		// - new client connecting via conn.getWriter
-		// - existing client sending data via the buffers channel
-		// - existing client closing the buffers channel
-		// - a control message being sent
 		select {
-		case slot := <-getWriter:
-			dataOpcode = slot.Opcode
-			dataBuffersIn = slot.Buffers
-			dataBufferPos = 0
-			slot.GetDone <- done
+		case frame := <-dfChan:
+			err := conn.writeFrame(frame.Opcode, frame.Body, frame.Final)
+			resChan <- err
+		case frame := <-cfChan:
+			conn.writeFrame(frame.Opcode, frame.Body, true)
+			// TODO(voss): handle write errors?
 
-			// do not accept new writers until this one is done
-			getWriter = nil
-
-		case buf, ok := <-dataBuffersIn:
-			total := 0
-			for {
-				n := copy(dataBuffer[dataBufferPos:], buf)
-				total += n
-				dataBufferPos += n
-				buf = buf[n:]
-
-				final := len(buf) == 0 && !ok
-				if dataBufferPos == dataBufferSize || final {
-					err := conn.writeFrame(dataOpcode, dataBuffer[:dataBufferPos], final)
-					if err != nil {
-						// TODO(voss): handle the error
-						break writerLoop
-					}
-					dataBufferPos = 0
-					dataOpcode = contFrame
-				}
-
-				if len(buf) == 0 {
-					break
-				}
-			}
-			done <- ioResult{N: total}
-			if !ok {
-				dataBuffersIn = nil
-				getWriter = data
-			}
-		case ctlMsg := <-ctl:
-			err := conn.writeFrame(ctlMsg.Opcode, ctlMsg.Body, true)
-			if err != nil {
-				// TODO(voss): handle the error
+			if frame.Opcode == closeFrame {
 				break writerLoop
 			}
-			conn.rw.Flush()
 		}
 	}
+	// from this point onwards we don't write to the connection any more
+
+	log.Println("draining writers")
+drainLoop:
+	for {
+		select {
+		case _ = <-dwChan:
+			close(dwChan)
+			dwChan = nil
+		case _ = <-dfChan:
+			resChan <- ErrConnClosed
+		case _, ok := <-cfChan:
+			if !ok {
+				break drainLoop
+			}
+		}
+	}
+	log.Println("writers done")
 }

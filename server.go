@@ -3,13 +3,12 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"time"
 )
-
-const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 type Handler struct {
 	AccessOk func(conn *Conn, protocols []string) bool
-	Handle   func(conn *Conn)
+	Handle   func(conn *Conn) CloseCode
 }
 
 func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -28,7 +27,7 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, msg, status)
 		return
 	}
-	// TODO(voaa): move this into newConn(), too?
+	// TODO(voss): move this into newConn(), too?
 	raw, rw, err := hijacker.Hijack()
 	if err != nil {
 		panic("Hijack failed: " + err.Error())
@@ -36,21 +35,54 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	conn.conn = raw
 	conn.rw = rw
 
-	defer raw.Close()
+	// TODO(voss): should the rest of this function be moved in a goroutine
+	// and the ServeHTTP method allowed to finish early?
 
-	serverReady := make(chan struct{})
-	userHandlerDone := make(chan struct{})
+	log.Println("opening new connection")
+
+	// start the server go-routines
+	writerReady := make(chan struct{})
+	go conn.writeMultiplexer(writerReady)
+	<-writerReady
+	readerReady := make(chan struct{})
+	readerDone := make(chan struct{})
 	go func() {
-		<-serverReady
-
-		// run the user-provided handler
-		handler.Handle(conn)
-
-		log.Println("user handler done")
-		close(userHandlerDone)
+		conn.readMultiplexer(readerReady)
+		close(readerDone)
 	}()
+	<-readerReady
 
-	conn.handle(serverReady, userHandlerDone)
+	// ----------------------------------------------------------------------
+	log.Println("starting user handler")
+	code := handler.Handle(conn)
+	log.Println("user handler done")
+	// ----------------------------------------------------------------------
+
+	// send a close frame and wait for confirmation from the client
+	conn.sendCloseFrame(code, "")
+	needsClose := true
+	timeOut := time.NewTimer(3 * time.Second)
+	select {
+	case <-readerDone:
+		if !timeOut.Stop() {
+			<-timeOut.C
+		}
+	case <-timeOut.C:
+		log.Println("client did not send close frame, killing connection")
+		raw.Close()
+		needsClose = false
+	}
+
+	// The reader uses conn.sendControlFrame, so we must be sure the
+	// reader has stopped, before we can close the challer to stop the
+	// writer.
+	<-readerDone
+	close(conn.sendControlFrame)
+
+	log.Println("closing connection")
+	if needsClose {
+		raw.Close()
+	}
 }
 
 type ioResult struct {

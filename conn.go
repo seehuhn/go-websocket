@@ -4,12 +4,24 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 )
+
+type Conn struct {
+	ResourceName *url.URL
+	Origin       *url.URL
+	Protocol     string
+
+	conn net.Conn
+	rw   *bufio.ReadWriter
+
+	getDataReader    <-chan *frameReader
+	getDataWriter    <-chan *frameWriter
+	sendControlFrame chan<- *frame
+}
 
 type FrameType byte
 
@@ -22,17 +34,31 @@ const (
 	pongFrame   FrameType = 10
 )
 
-type Conn struct {
-	ResourceName *url.URL
-	Origin       *url.URL
-	Protocol     string
+type CloseCode uint16
 
-	conn net.Conn
-	rw   *bufio.ReadWriter
+const (
+	CodeOK                  CloseCode = 1000
+	codeProtocolError       CloseCode = 1002
+	codeMissing             CloseCode = 1005
+	codeUnexpectedCondition CloseCode = 1011
+)
 
-	readMessage <-chan *wsReader
-	getWriter   chan<- *writerSlot
-	sendControl chan<- *controlMsg
+const (
+	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
+	pingGUID      = "9c5192f2-4504-4cda-b9d4-8ec8e744166a" // locally generated
+)
+
+type header struct {
+	Length uint64
+	Mask   []byte
+	Final  bool
+	Opcode FrameType
+}
+
+type frame struct {
+	Body   []byte
+	Final  bool
+	Opcode FrameType
 }
 
 func newConn() *Conn {
@@ -113,32 +139,19 @@ func getAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-func (conn *Conn) handle(serverReady chan<- struct{}, userDone <-chan struct{}) {
-	rcv := make(chan *wsReader, 1)
-	conn.readMessage = rcv
-
-	snd := make(chan *writerSlot, 1)
-	conn.getWriter = snd
-
-	ctl := make(chan *controlMsg)
-	conn.sendControl = ctl
-
-	close(serverReady)
-
-	go conn.writeFrames(snd, ctl)
-	conn.readFrames(rcv)
-
-	log.Println("server handler done")
-}
-
-type frame struct {
-	Final  bool
-	Opcode FrameType
-	Length uint64
-	Mask   []byte
-}
-
-type controlMsg struct {
-	Opcode FrameType
-	Body   []byte
+func (conn *Conn) sendCloseFrame(code CloseCode, message string) {
+	msg := []byte(message)
+	var buf []byte
+	if code != 0 && code != codeMissing {
+		buf = make([]byte, 2+len(msg))
+		buf[0] = byte(code >> 8)
+		buf[1] = byte(code)
+		copy(buf[2:], msg)
+	}
+	ctl := &frame{
+		Opcode: closeFrame,
+		Body:   buf,
+		Final:  true,
+	}
+	conn.sendControlFrame <- ctl
 }

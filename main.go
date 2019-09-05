@@ -5,6 +5,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -23,25 +24,30 @@ func checkAccess(conn *websocket.Conn, protocols []string) bool {
 	return true
 }
 
-func handle(conn *websocket.Conn) {
+func handle(conn *websocket.Conn) websocket.CloseCode {
 	for {
 		err := conn.SendText("hello, client!")
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("A ", err)
 		}
 
-		opcode, r, err := conn.ReceiveMessage()
+		_, r, err := conn.ReceiveMessage()
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("B ", err)
 		}
-		fmt.Println("received message type", opcode)
 		buf := make([]byte, 256)
 		n, err := r.Read(buf)
-		if err != nil {
-			log.Fatal(err)
+		if err != nil && err != io.EOF {
+			log.Fatal("C ", err)
 		}
-		fmt.Println("message:", string(buf[:n]))
+		msg := string(buf[:n])
+		fmt.Println("message:", msg)
+
+		if msg == "Noptaloo" {
+			return 4444
+		}
 	}
+	return websocket.CodeOK
 }
 
 func main() {
