@@ -20,7 +20,8 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
-	"log"
+	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,6 +29,8 @@ import (
 	"sync"
 	"time"
 )
+
+var debug = flag.Bool("debug", false, "print all frames sent and received")
 
 // Conn represents a websocket connection initiated by a client.  All
 // fields are read-only.  It is ok to access a Conn from different
@@ -103,7 +106,7 @@ type frame struct {
 }
 
 func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
-	accessOk func(*Conn, []string) bool) (status int, message string) {
+	handler *Handler) (status int, message string) {
 
 	headers := w.Header()
 
@@ -158,8 +161,8 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 		}
 	}
 
-	if accessOk != nil {
-		ok := accessOk(conn, protocols)
+	if handler.AccessOk != nil {
+		ok := handler.AccessOk(conn, protocols)
 		if !ok {
 			return http.StatusForbidden, "not allowed"
 		}
@@ -170,12 +173,19 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	h.Write([]byte(websocketGUID))
 	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
+	if *debug {
+		fmt.Printf("⌜CONN new client: PROTO=%q\n", conn.Protocol)
+	}
+
 	if conn.Protocol != "" {
 		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
 	}
 	headers.Set("Upgrade", "websocket")
 	headers.Set("Connection", "Upgrade")
 	headers.Set("Sec-WebSocket-Accept", accept)
+	if handler.ServerName != "" {
+		headers.Set("Server", handler.ServerName)
+	}
 	return http.StatusSwitchingProtocols, ""
 }
 
@@ -236,7 +246,6 @@ func (conn *Conn) Close(code Status, message string) error {
 			<-timeOut.C
 		}
 	case <-timeOut.C:
-		log.Println("client did not send close frame, killing connection")
 		conn.raw.Close()
 		needsClose = false
 	}
@@ -253,7 +262,6 @@ func (conn *Conn) Close(code Status, message string) error {
 	}
 	conn.closeMutex.Unlock()
 
-	log.Println("closing connection")
 	if needsClose {
 		conn.raw.Close()
 	}

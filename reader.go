@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 )
 
 // ReceiveBinary reads a binary message from the connection.  If the
@@ -163,22 +162,29 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 
 // readFrameHeader reads and decodes a frame header
 func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
-	n, err := conn.rw.Read(buf[:2])
+	n, err := io.ReadFull(conn.rw, buf[:2])
 	if err != nil {
+		if *debug {
+			fmt.Printf("|RX error, header [% 02x]: %s\n", buf[:n], err)
+		}
 		return nil, err
-	} else if n < 2 {
-		return nil, errFrameFormat
 	}
 
 	final := buf[0] & 128
 	reserved := (buf[0] >> 4) & 7
 	if reserved != 0 {
+		if *debug {
+			fmt.Printf("|RX error, header [% 02x]: reserved bits set\n", buf[:2])
+		}
 		return nil, errFrameFormat
 	}
 	opcode := buf[0] & 15
 
 	mask := buf[1] & 128
 	if mask == 0 {
+		if *debug {
+			fmt.Printf("|RX error, header [% 02x]: missing mask\n", buf[:2])
+		}
 		return nil, errFrameFormat
 	}
 
@@ -191,8 +197,12 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 		lengthBytes = 2
 	}
 	if lengthBytes > 1 {
-		n, _ := conn.rw.Read(buf[:lengthBytes])
+		n, _ := io.ReadFull(conn.rw, buf[:lengthBytes])
 		if n < lengthBytes {
+			if *debug {
+				fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t, LENGTH ERROR\n",
+					opcode, final != 0)
+			}
 			return nil, errFrameFormat
 		}
 	} else {
@@ -203,21 +213,35 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 		length = length<<8 | uint64(buf[i])
 	}
 	if length&(1<<63) != 0 {
+		if *debug {
+			fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d, MSB ERROR\n",
+				opcode, final != 0, length)
+		}
 		return nil, errFrameFormat
 	}
 
 	if opcode >= 8 && (final == 0 || length > 125) {
+		if *debug {
+			fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d, FRAME ERROR\n",
+				opcode, final != 0, length)
+		}
 		return nil, errFrameFormat
 	}
 
 	// read the masking key
-	n, _ = conn.rw.Read(buf[:4])
+	n, _ = io.ReadFull(conn.rw, buf[:4])
 	if n < 4 {
+		if *debug {
+			fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d, MASK ERROR\n",
+				opcode, final != 0, length)
+		}
 		return nil, errFrameFormat
 	}
 
-	fmt.Println("R", opcode, length, map[bool]string{true: "final"}[final != 0])
-
+	if *debug {
+		fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d\n",
+			opcode, final != 0, length)
+	}
 	return &header{
 		Final:  final != 0,
 		Opcode: MessageType(opcode),
@@ -262,14 +286,12 @@ readLoop:
 		if err != nil {
 			if err == errFrameFormat {
 				status = StatusProtocolError
-			} else {
-				fmt.Printf("READ ERROR: %#v\n", err)
 			}
 			break readLoop
 		}
 
 		switch header.Opcode {
-		case Text, Binary:
+		case Text, Binary, contFrame:
 			dfChan <- header
 			<-resChan
 		case closeFrame:
@@ -282,7 +304,6 @@ readLoop:
 				status = statusMissing
 				closeMessage = ""
 			}
-			log.Println("CLOSE", status, closeMessage)
 			break readLoop
 		case pingFrame:
 			buf, err := conn.readFrameBody(header)
@@ -304,7 +325,7 @@ readLoop:
 			}
 		default:
 			status = StatusProtocolError
-			closeMessage = fmt.Sprintf("invalid opcode %d", header.Opcode)
+			closeMessage = "invalid opcode"
 			break readLoop
 		}
 	}
@@ -316,5 +337,4 @@ readLoop:
 	// since the server will ignore everything after it has
 	// sent a close message once.
 	conn.sendCloseFrame(status, []byte(closeMessage))
-	log.Println("readers done")
 }

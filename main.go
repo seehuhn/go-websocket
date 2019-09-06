@@ -20,7 +20,9 @@ func checkAccess(conn *websocket.Conn, protocols []string) bool {
 	log.Println("ResourceName:", conn.ResourceName)
 	log.Println("Origin:", conn.Origin)
 	log.Println("Protocols:", strings.Join(protocols, ", "))
-	conn.Protocol = protocols[0]
+	if len(protocols) > 0 {
+		conn.Protocol = protocols[0]
+	}
 	return true
 }
 
@@ -46,6 +48,8 @@ func handle(conn *websocket.Conn) {
 }
 
 func main() {
+	flag.Parse()
+
 	http.Handle("/", http.FileServer(http.Dir(*root)))
 
 	websocket := &websocket.Handler{

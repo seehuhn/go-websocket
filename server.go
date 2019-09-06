@@ -17,7 +17,6 @@
 package websocket
 
 import (
-	"log"
 	"net/http"
 )
 
@@ -50,6 +49,10 @@ type Handler struct {
 	// Handle is complete.  Use conn.Close() to close the connection
 	// after use.
 	Handle func(conn *Conn)
+
+	// If non-empty, this string is sent in the "Server" HTTP header
+	// during handshake.
+	ServerName string
 }
 
 func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -61,7 +64,7 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	conn := &Conn{}
-	status, msg := conn.handshake(w, req, handler.AccessOk)
+	status, msg := conn.handshake(w, req, handler)
 	if status == http.StatusSwitchingProtocols {
 		w.WriteHeader(status)
 	} else {
@@ -78,8 +81,6 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// TODO(voss): should the rest of this function be moved into a goroutine
 	// and the ServeHTTP method allowed to finish early?
-
-	log.Println("opening new connection")
 
 	// start the server go-routines
 	writerReady := make(chan struct{})

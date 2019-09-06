@@ -19,7 +19,6 @@ package websocket
 import (
 	"fmt"
 	"io"
-	"log"
 )
 
 const maxHeaderSize = 10
@@ -124,7 +123,11 @@ func (w *frameWriter) Close() error {
 }
 
 func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error {
-	fmt.Println("W", opcode, len(body), map[bool]string{true: "final"}[final])
+	if *debug {
+		payload := formatBody(body)
+		fmt.Printf("|TX FRAME: OPCODE=%d FIN=%t LEN=%d %s\n",
+			opcode, final, len(body), payload)
+	}
 
 	var header [maxHeaderSize]byte
 
@@ -204,13 +207,21 @@ writerLoop:
 			// TODO(voss): handle write errors?
 
 			if frame.Opcode == closeFrame {
+				if *debug {
+					if len(frame.Body) >= 2 {
+						fmt.Printf("⌞CONN closed, status=%d, msg=%q\n",
+							256*int(frame.Body[0])+int(frame.Body[1]),
+							string(frame.Body[2:]))
+					} else {
+						fmt.Println("⌞CONN closed")
+					}
+				}
 				break writerLoop
 			}
 		}
 	}
 	// from this point onwards we don't write to the connection any more
 
-	log.Println("draining writers")
 drainLoop:
 	for {
 		select {
@@ -225,5 +236,4 @@ drainLoop:
 			}
 		}
 	}
-	log.Println("writers done")
 }
