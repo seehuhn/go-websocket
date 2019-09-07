@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"text/template"
@@ -22,14 +23,22 @@ import (
 )
 
 var (
-	port    = flag.String("port", "8080", "what TCP port to bind to")
-	scratch = flag.String("dir", "scratch", "directory for wstest to work in")
+	port       = flag.String("port", "8080", "what TCP port to bind to")
+	scratch    = flag.String("dir", "scratch", "directory for wstest to work in")
+	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 )
 
 type testList []string
 
 func (tl *testList) String() string {
-	return strings.Join(*tl, ",")
+	if len(*tl) == 0 {
+		return "\"*\""
+	}
+	b, err := json.Marshal(testCases)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return string(b)
 }
 
 func (tl *testList) Set(value string) error {
@@ -125,11 +134,7 @@ func echo(conn *websocket.Conn) {
 	}
 }
 
-func main() {
-	flag.Var(&testCases, "test", "comma-separated list of tests to perform")
-	flag.Parse()
-
-	// find an interface which can be reached from inside the Docker container
+func findLocalAddress() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		log.Fatal(err)
@@ -155,18 +160,16 @@ ifaceLoop:
 	if useAddr == nil {
 		log.Fatal("no usable IP address found")
 	}
-	listenAddr := net.JoinHostPort(useAddr.String(), *port)
-	log.Println("listening at", listenAddr)
+	return net.JoinHostPort(useAddr.String(), *port)
+}
 
-	// extract the list of tests
-	if len(testCases) == 0 {
-		testCases = []string{"*"}
-	}
-	b, err := json.Marshal(testCases)
-	if err != nil {
-		log.Fatal(err)
-	}
-	cases := string(b)
+func main() {
+	flag.Var(&testCases, "test", "comma-separated list of tests to perform")
+	flag.Parse()
+
+	// find an address which can be reached from inside the Docker container
+	listenAddr := findLocalAddress()
+	log.Println("listening at", listenAddr)
 
 	// Create the configuration file
 	os.Mkdir(*scratch, 0755)
@@ -180,10 +183,20 @@ ifaceLoop:
 	}
 	err = tmpl.Execute(spec, map[string]string{
 		"host":  listenAddr,
-		"cases": cases,
+		"cases": testCases.String(),
 	})
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// enable CPU profiling
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
 
 	// open the socket
