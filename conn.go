@@ -20,8 +20,6 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
-	"flag"
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,8 +27,6 @@ import (
 	"sync"
 	"time"
 )
-
-var debug = flag.Bool("debug", false, "print all frames sent and received")
 
 // Conn represents a websocket connection initiated by a client.  All
 // fields are read-only.  It is ok to access a Conn from different
@@ -88,7 +84,7 @@ const (
 	StatusUnsupportedType     Status = 1003
 	StatusInvalidData         Status = 1007
 	StatusPolicyViolation     Status = 1008
-	StatusTooBig              Status = 1009
+	StatusTooLarge            Status = 1009
 	StatusInternalServerError Status = 1011
 
 	statusMissing Status = 1005
@@ -177,10 +173,6 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 	h.Write([]byte(websocketGUID))
 	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-	if *debug {
-		fmt.Printf("⌜CONN new client: PROTO=%q\n", conn.Protocol)
-	}
-
 	if conn.Protocol != "" {
 		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
 	}
@@ -223,7 +215,7 @@ var knownValidCode = map[Status]bool{
 	StatusUnsupportedType: true,
 	StatusInvalidData:     true,
 	StatusPolicyViolation: true,
-	StatusTooBig:          true,
+	StatusTooLarge:        true,
 	1010:                  true, // never sent by server
 	StatusInternalServerError: true,
 }
@@ -246,9 +238,9 @@ func isValidStatus(code Status) bool {
 // successfully, or due to an error.  Use StatusOK for normal
 // termination, and one of the other status codes in case of errors.
 //
-// Message can be used to provide additional information for
+// The message can be used to provide additional information for
 // debugging.  The utf-8 representation of the string must be at most
-// 123 bytes long.
+// 123 bytes long, otherwise ErrTooLarge is returned.
 func (conn *Conn) Close(code Status, message string) error {
 	if !isValidStatus(code) || code == 1010 {
 		return ErrStatusCode

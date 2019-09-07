@@ -14,5 +14,27 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Package websocket implements a HTTP server to establish websocket connections.
+/*
+Package websocket implements an HTTP server to accept websocket connections.
+
+To accept websocket connections from clients, use a websocket.Handler
+object:
+
+	websocketHandler := &websocket.Handler{
+		Handle: myHandler,
+	}
+	http.Handle("/api/ws", websocketHandler)
+
+The function myHandler is called every time a client requests a new
+websocket.  The websocket.Conn object passed to handler can be used
+to send and receive messages.  The handler must close the connection
+when finished with it:
+
+	func myHandler(conn *websocket.Conn) {
+		defer conn.Close(websocket.StatusOK, "")
+
+		// use conn to send and receive messages.
+	}
+
+*/
 package websocket

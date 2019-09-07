@@ -19,7 +19,6 @@ package websocket
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"unicode/utf8"
@@ -189,27 +188,18 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 	n, err := io.ReadFull(conn.rw, buf[:2])
 	if err != nil {
-		if *debug {
-			fmt.Printf("|RX error, header [% 02x]: %s\n", buf[:n], err)
-		}
 		return nil, err
 	}
 
 	final := buf[0] & 128
 	reserved := (buf[0] >> 4) & 7
 	if reserved != 0 {
-		if *debug {
-			fmt.Printf("|RX error, header [% 02x]: reserved bits set\n", buf[:2])
-		}
 		return nil, errFrameFormat
 	}
 	opcode := buf[0] & 15
 
 	mask := buf[1] & 128
 	if mask == 0 {
-		if *debug {
-			fmt.Printf("|RX error, header [% 02x]: missing mask\n", buf[:2])
-		}
 		return nil, errFrameFormat
 	}
 
@@ -224,10 +214,6 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 	if lengthBytes > 1 {
 		n, _ := io.ReadFull(conn.rw, buf[:lengthBytes])
 		if n < lengthBytes {
-			if *debug {
-				fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t, LENGTH ERROR\n",
-					opcode, final != 0)
-			}
 			return nil, errFrameFormat
 		}
 	} else {
@@ -238,35 +224,19 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 		length = length<<8 | uint64(buf[i])
 	}
 	if length&(1<<63) != 0 {
-		if *debug {
-			fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d, MSB ERROR\n",
-				opcode, final != 0, length)
-		}
 		return nil, errFrameFormat
 	}
 
 	if opcode >= 8 && (final == 0 || length > 125) {
-		if *debug {
-			fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d, FRAME ERROR\n",
-				opcode, final != 0, length)
-		}
 		return nil, errFrameFormat
 	}
 
 	// read the masking key
 	n, _ = io.ReadFull(conn.rw, buf[:4])
 	if n < 4 {
-		if *debug {
-			fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d, MASK ERROR\n",
-				opcode, final != 0, length)
-		}
 		return nil, errFrameFormat
 	}
 
-	if *debug {
-		fmt.Printf("|RX FRAME: OPCODE=%d FIN=%t LEN=%d\n",
-			opcode, final != 0, length)
-	}
 	return &header{
 		Final:  final != 0,
 		Opcode: MessageType(opcode),
@@ -330,7 +300,8 @@ readLoop:
 			<-resChan
 		case closeFrame:
 			buf, _ := conn.readFrameBody(header)
-			// we are exiting anyway, so we don't need to check for errors here
+			// Since we are exiting anyway, we don't need to check for
+			// read errors here.
 			if len(buf) >= 2 {
 				status = 256*Status(buf[0]) + Status(buf[1])
 				if isValidStatus(status) && utf8.Valid(buf[2:]) {

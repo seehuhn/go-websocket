@@ -17,7 +17,6 @@
 package websocket
 
 import (
-	"fmt"
 	"io"
 )
 
@@ -123,12 +122,6 @@ func (w *frameWriter) Close() error {
 }
 
 func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error {
-	if *debug {
-		payload := formatBody(body)
-		fmt.Printf("|TX FRAME: OPCODE=%d FIN=%t LEN=%d %s\n",
-			opcode, final, len(body), payload)
-	}
-
 	var header [maxHeaderSize]byte
 
 	header[0] = byte(opcode)
@@ -208,15 +201,6 @@ writerLoop:
 			conn.writeFrame(frame.Opcode, frame.Body, true)
 
 			if frame.Opcode == closeFrame {
-				if *debug {
-					if len(frame.Body) >= 2 {
-						fmt.Printf("⌞CONN closed, status=%d, msg=%q\n",
-							256*int(frame.Body[0])+int(frame.Body[1]),
-							string(frame.Body[2:]))
-					} else {
-						fmt.Println("⌞CONN closed")
-					}
-				}
 				break writerLoop
 			}
 		}
