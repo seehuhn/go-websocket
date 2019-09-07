@@ -3,8 +3,9 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
-	"html/template"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -13,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"text/template"
 
 	"seehuhn.de/go/websocket"
 )
@@ -20,36 +23,55 @@ import (
 var (
 	port    = flag.String("port", "8080", "what TCP port to bind to")
 	scratch = flag.String("dir", "scratch", "directory for wstest to work in")
-	cases   = flag.String("cases", "*", "test cases to run")
 )
+
+type testList []string
+
+func (tl *testList) String() string {
+	return strings.Join(*tl, ",")
+}
+
+func (tl *testList) Set(value string) error {
+	for _, s := range strings.Split(value, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			*tl = append(*tl, s)
+		}
+	}
+	return nil
+}
+
+var testCases testList
 
 func echo(conn *websocket.Conn) {
 	defer conn.Close(websocket.StatusOK, "")
 
-	tp, r, err := conn.ReceiveMessage()
-	if err == websocket.ErrConnClosed {
-		return
-	} else if err != nil {
-		log.Println("read error", err)
-		return
-	}
+	for {
+		tp, r, err := conn.ReceiveMessage()
+		if err == websocket.ErrConnClosed {
+			break
+		} else if err != nil {
+			log.Println("read error", err)
+			break
+		}
 
-	w, err := conn.SendMessage(tp)
-	if err != nil {
-		log.Println("write error", err)
-		n, err := io.Copy(ioutil.Discard, r)
-		log.Println("discard", n, err)
-		return
-	}
+		w, err := conn.SendMessage(tp)
+		if err != nil {
+			log.Println("write error", err)
+			n, err := io.Copy(ioutil.Discard, r)
+			log.Println("discard", n, err)
+			break
+		}
 
-	n, err := io.Copy(w, r)
-	if err != nil {
-		log.Println("ECHO", n, err)
-		io.Copy(ioutil.Discard, r)
-	}
-	err = w.Close()
-	if err != nil && err != websocket.ErrConnClosed {
-		log.Println("CLOSE ERROR", err)
+		n, err := io.Copy(w, r)
+		if err != nil {
+			log.Println("ECHO", n, err)
+			io.Copy(ioutil.Discard, r)
+		}
+		err = w.Close()
+		if err != nil && err != websocket.ErrConnClosed {
+			log.Println("CLOSE ERROR", err)
+		}
 	}
 }
 
@@ -98,6 +120,7 @@ func runDocker(scratch string, done chan<- struct{}) {
 }
 
 func main() {
+	flag.Var(&testCases, "test", "comma-separated list of tests to perform")
 	flag.Parse()
 
 	// find an interface which can be reached from inside the Docker container
@@ -129,6 +152,16 @@ ifaceLoop:
 	listenAddr := net.JoinHostPort(useAddr.String(), *port)
 	log.Println("listening at", listenAddr)
 
+	// extract the list of tests
+	if len(testCases) == 0 {
+		testCases = []string{"*"}
+	}
+	b, err := json.Marshal(testCases)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cases := string(b)
+
 	// Create the configuration file
 	os.Mkdir(*scratch, 0755)
 	tmpl, err := template.ParseFiles("spec.tmpl")
@@ -141,7 +174,7 @@ ifaceLoop:
 	}
 	err = tmpl.Execute(spec, map[string]string{
 		"host":  listenAddr,
-		"cases": *cases,
+		"cases": cases,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -172,4 +205,7 @@ ifaceLoop:
 	<-dockerDone
 	l.Close()
 	<-serverDone
+
+	fmt.Printf("\nThe report is in %q.\n",
+		filepath.Join(*scratch, "index.html"))
 }

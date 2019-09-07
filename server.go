@@ -82,18 +82,16 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// TODO(voss): should the rest of this function be moved into a goroutine
 	// and the ServeHTTP method allowed to finish early?
 
-	// start the server go-routines
+	// start the write multiplexer
 	writerReady := make(chan struct{})
 	go conn.writeMultiplexer(writerReady)
 	<-writerReady
+
+	// start the read multiplexer
 	readerReady := make(chan struct{})
-	readerDone := make(chan struct{})
-	conn.readerDone = readerDone
-	go func() {
-		conn.readMultiplexer(readerReady)
-		close(readerDone)
-	}()
+	go conn.readMultiplexer(readerReady)
 	<-readerReady
 
+	// start the user handler
 	handler.Handle(conn)
 }

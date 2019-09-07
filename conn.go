@@ -47,6 +47,7 @@ type Conn struct {
 	rw  *bufio.ReadWriter
 
 	readerDone <-chan struct{}
+	writerDone <-chan struct{}
 
 	getDataReader    <-chan *frameReader
 	getDataWriter    <-chan *frameWriter
@@ -85,6 +86,7 @@ const (
 	StatusUnsupportedType     Status = 1003
 	StatusInvalidData         Status = 1007
 	StatusPolicyViolation     Status = 1008
+	StatusTooBig              Status = 1009
 	StatusInternalServerError Status = 1011
 
 	statusMissing Status = 1005
@@ -212,6 +214,28 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 	return nil
 }
 
+var knownValidCode = map[Status]bool{
+	StatusOK:              true,
+	StatusGoingAway:       true,
+	StatusProtocolError:   true,
+	StatusUnsupportedType: true,
+	StatusInvalidData:     true,
+	StatusPolicyViolation: true,
+	StatusTooBig:          true,
+	1010:                  true, // never sent by server
+	StatusInternalServerError: true,
+}
+
+func isValidStatus(code Status) bool {
+	if code >= 5000 {
+		return false
+	}
+	if code >= 3000 {
+		return true
+	}
+	return knownValidCode[code]
+}
+
 // Close terminates a websocket connection and frees all associated
 // resources.  The connection cannot be used any more after Close()
 // has been called.
@@ -224,7 +248,7 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 // debugging.  The utf-8 representation of the string must be at most
 // 123 bytes long.
 func (conn *Conn) Close(code Status, message string) error {
-	if code < 1000 || code >= 5000 {
+	if !isValidStatus(code) || code == 1010 {
 		return ErrStatusCode
 	}
 
@@ -263,6 +287,7 @@ func (conn *Conn) Close(code Status, message string) error {
 	conn.closeMutex.Unlock()
 
 	if needsClose {
+		<-conn.writerDone
 		conn.raw.Close()
 	}
 

@@ -175,6 +175,8 @@ func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error 
 // channels, returning ErrConnClosed for all write attempts, and
 // terminates once conn.sendControlFrame is closed.
 func (conn *Conn) writeMultiplexer(ready chan<- struct{}) {
+	writerDone := make(chan struct{})
+	conn.writerDone = writerDone
 	cfChan := make(chan *frame, 1)
 	conn.sendControlFrame = cfChan
 	dwChan := make(chan *frameWriter, 1)
@@ -204,7 +206,6 @@ writerLoop:
 			resChan <- err
 		case frame := <-cfChan:
 			conn.writeFrame(frame.Opcode, frame.Body, true)
-			// TODO(voss): handle write errors?
 
 			if frame.Opcode == closeFrame {
 				if *debug {
@@ -220,7 +221,9 @@ writerLoop:
 			}
 		}
 	}
+
 	// from this point onwards we don't write to the connection any more
+	close(writerDone)
 
 drainLoop:
 	for {

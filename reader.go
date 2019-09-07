@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"unicode/utf8"
 )
 
 // ReceiveBinary reads a binary message from the connection.  If the
@@ -49,7 +50,7 @@ func (conn *Conn) receiveLimited(ex MessageType, maxLength int) ([]byte, error) 
 	}
 
 	res := &bytes.Buffer{}
-	if tp == ex {
+	if tp == ex || tp == contFrame {
 		_, err = io.CopyN(res, r, int64(maxLength))
 	} else {
 		err = ErrMessageType
@@ -87,6 +88,10 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 	r.Final = header.Final
 	r.Mask = header.Mask
 
+	if r.Length == 0 {
+		r.Result <- struct{}{}
+	}
+
 	return header.Opcode, r, nil
 }
 
@@ -105,6 +110,7 @@ type frameReader struct {
 func (r *frameReader) Read(buf []byte) (n int, err error) {
 	if r.Pos == r.Length && !r.Final && r.Receive != nil {
 		// get a new header
+	retry:
 		header := <-r.Receive
 		if header == nil {
 			r.Final = true
@@ -113,6 +119,11 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 			r.Length = header.Length
 			r.Final = header.Final
 			r.Mask = header.Mask
+		}
+
+		if r.Length == 0 && !r.Final {
+			r.Result <- struct{}{}
+			goto retry
 		}
 	}
 
@@ -262,6 +273,8 @@ func (conn *Conn) readFrameBody(header *header) ([]byte, error) {
 // readMultiplexer multiplexes all data reads from the network.
 // Control frames are handled internally by this function.
 func (conn *Conn) readMultiplexer(ready chan<- struct{}) {
+	readerDone := make(chan struct{})
+	conn.readerDone = readerDone
 	drChan := make(chan *frameReader, 1)
 	conn.getDataReader = drChan
 
@@ -279,6 +292,7 @@ func (conn *Conn) readMultiplexer(ready chan<- struct{}) {
 
 	status := StatusInternalServerError
 	closeMessage := ""
+	needsCont := false
 	var headerBuf [10]byte
 readLoop:
 	for {
@@ -292,6 +306,12 @@ readLoop:
 
 		switch header.Opcode {
 		case Text, Binary, contFrame:
+			if (header.Opcode == contFrame) != needsCont {
+				status = StatusProtocolError
+				break readLoop
+			}
+			needsCont = !header.Final
+
 			dfChan <- header
 			<-resChan
 		case closeFrame:
@@ -299,7 +319,11 @@ readLoop:
 			// we are exiting anyway, so we don't need to check for errors here
 			if len(buf) >= 2 {
 				status = 256*Status(buf[0]) + Status(buf[1])
-				closeMessage = string(buf[2:])
+				if isValidStatus(status) && utf8.Valid(buf[2:]) {
+					closeMessage = string(buf[2:])
+				} else {
+					status = StatusProtocolError
+				}
 			} else {
 				status = statusMissing
 				closeMessage = ""
@@ -337,4 +361,6 @@ readLoop:
 	// since the server will ignore everything after it has
 	// sent a close message once.
 	conn.sendCloseFrame(status, []byte(closeMessage))
+
+	close(readerDone)
 }
