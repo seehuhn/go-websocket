@@ -79,56 +79,63 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 		return 0, nil, ErrConnClosed
 	}
 
-	header := <-r.Receive
-	if header == nil {
+	opcode := r.getNextHeader()
+	if opcode == invalidFrame {
+		r.Done <- r
 		return 0, nil, ErrConnClosed
 	}
-	r.Pos = 0
-	r.Length = header.Length
-	r.Final = header.Final
-	r.Mask = header.Mask
-
-	if r.Length == 0 {
-		r.Result <- struct{}{}
-	}
-
-	return header.Opcode, r, nil
+	return opcode, r, nil
 }
 
 type frameReader struct {
 	Receive <-chan *header
 	Result  chan<- struct{}
 	Done    chan<- *frameReader
+	closed  bool
 
 	rw *bufio.ReadWriter
 
-	Pos, Length uint64
-	Final       bool
-	Mask        []byte
+	// the following fields are all initialised by getNextHeader()
+	confirmed  bool
+	Remaining  uint64
+	Final      bool
+	Mask       []byte
+	maskPos    int
+	connClosed bool
+}
+
+func (r *frameReader) getNextHeader() MessageType {
+	header := <-r.Receive
+	if header == nil {
+		r.confirmed = true
+		r.connClosed = true
+		return invalidFrame
+	}
+	r.confirmed = false
+	r.Remaining = header.Length
+	r.Final = header.Final
+	r.Mask = header.Mask
+	r.maskPos = 0
+	r.connClosed = false
+	return header.Opcode
 }
 
 func (r *frameReader) Read(buf []byte) (n int, err error) {
-	if r.Pos == r.Length && !r.Final && r.Receive != nil {
-		// get a new header
-	retry:
-		header := <-r.Receive
-		if header == nil {
-			r.Final = true
-		} else {
-			r.Pos = 0
-			r.Length = header.Length
-			r.Final = header.Final
-			r.Mask = header.Mask
+	for r.Remaining == 0 {
+		if !r.confirmed {
+			r.Result <- struct{}{}
+			r.confirmed = true
 		}
 
-		if r.Length == 0 && !r.Final {
-			r.Result <- struct{}{}
-			goto retry
+		if r.Final || r.connClosed {
+			break
 		}
+
+		r.getNextHeader()
 	}
 
 	// read data from the network
-	maxLen := r.Length - r.Pos
+	maxLen := r.Remaining
 	if maxLen > 0 {
 		bufLen64 := uint64(len(buf))
 		if maxLen > bufLen64 {
@@ -136,38 +143,45 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 		}
 
 		n, err = r.rw.Read(buf[:maxLen])
-		offs := int(r.Pos % 4)
+		r.Remaining -= uint64(n)
+
+		offs := r.maskPos
 		for i := 0; i < n; i++ {
 			buf[i] ^= r.Mask[(i+offs)%4]
 		}
-		r.Pos += uint64(n)
-		if r.Pos == r.Length {
-			// tell the multiplexer that we have read our allocated share of bytes
-			r.Result <- struct{}{}
+		r.maskPos = (offs + n) % 4
+	}
+
+	if r.Remaining == 0 && !r.confirmed {
+		r.Result <- struct{}{}
+		r.confirmed = true
+	}
+
+	if r.Remaining == 0 && (r.Final || r.connClosed) {
+		if r.Receive != nil {
+			// End of message reached, return a frameReader to the channel
+			// and disable the current frameReader.
+			newR := &frameReader{
+				Receive: r.Receive,
+				Result:  r.Result,
+				Done:    r.Done,
+				rw:      r.rw,
+			}
+			r.Done <- newR
+
+			r.Receive = nil
+			r.Result = nil
+			r.Done = nil
+			r.rw = nil
+		}
+		if err == nil {
+			if r.Final {
+				err = io.EOF
+			} else if r.connClosed {
+				err = ErrConnClosed
+			}
 		}
 	}
-
-	if r.Pos == r.Length && r.Final && r.Receive != nil {
-		// End of message reached, return a frameReader to the channel
-		// and disable the current frameReader.
-		newR := &frameReader{
-			Receive: r.Receive,
-			Result:  r.Result,
-			Done:    r.Done,
-			rw:      r.rw,
-		}
-		r.Done <- newR
-
-		r.Receive = nil
-		r.Result = nil
-		r.Done = nil
-		r.rw = nil
-	}
-
-	if r.Pos == r.Length && r.Receive == nil && err == nil {
-		err = io.EOF
-	}
-
 	return
 }
 

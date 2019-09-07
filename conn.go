@@ -70,6 +70,8 @@ const (
 	closeFrame MessageType = 8
 	pingFrame  MessageType = 9
 	pongFrame  MessageType = 10
+
+	invalidFrame MessageType = 255
 )
 
 // Status describes the reason for the closure of a websocket

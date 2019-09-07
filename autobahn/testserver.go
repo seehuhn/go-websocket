@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"text/template"
 
 	"seehuhn.de/go/websocket"
@@ -42,38 +43,6 @@ func (tl *testList) Set(value string) error {
 }
 
 var testCases testList
-
-func echo(conn *websocket.Conn) {
-	defer conn.Close(websocket.StatusOK, "")
-
-	for {
-		tp, r, err := conn.ReceiveMessage()
-		if err == websocket.ErrConnClosed {
-			break
-		} else if err != nil {
-			log.Println("read error", err)
-			break
-		}
-
-		w, err := conn.SendMessage(tp)
-		if err != nil {
-			log.Println("write error", err)
-			n, err := io.Copy(ioutil.Discard, r)
-			log.Println("discard", n, err)
-			break
-		}
-
-		n, err := io.Copy(w, r)
-		if err != nil {
-			log.Println("ECHO", n, err)
-			io.Copy(ioutil.Discard, r)
-		}
-		err = w.Close()
-		if err != nil && err != websocket.ErrConnClosed {
-			log.Println("CLOSE ERROR", err)
-		}
-	}
-}
 
 func runDocker(scratch string, done chan<- struct{}) {
 	dockerPath, err := exec.LookPath("docker")
@@ -117,6 +86,43 @@ func runDocker(scratch string, done chan<- struct{}) {
 	}
 
 	close(done)
+}
+
+var wg sync.WaitGroup
+
+func echo(conn *websocket.Conn) {
+	wg.Add(1)
+	defer wg.Done()
+
+	defer conn.Close(websocket.StatusOK, "")
+
+	for {
+		tp, r, err := conn.ReceiveMessage()
+		if err == websocket.ErrConnClosed {
+			break
+		} else if err != nil {
+			log.Println("read error", err)
+			break
+		}
+
+		w, err := conn.SendMessage(tp)
+		if err != nil {
+			log.Println("write error", err)
+			n, err := io.Copy(ioutil.Discard, r)
+			log.Println("discard", n, err)
+			break
+		}
+
+		n, err := io.Copy(w, r)
+		if err != nil {
+			log.Println("ECHO", n, err)
+			io.Copy(ioutil.Discard, r)
+		}
+		err = w.Close()
+		if err != nil && err != websocket.ErrConnClosed {
+			log.Println("CLOSE ERROR", err)
+		}
+	}
 }
 
 func main() {
@@ -208,4 +214,8 @@ ifaceLoop:
 
 	fmt.Printf("\nThe report is in %q.\n",
 		filepath.Join(*scratch, "index.html"))
+
+	fmt.Println("\nif the server hangs here, some clients have not terminated")
+	wg.Wait()
+
 }
