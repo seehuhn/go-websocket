@@ -1,0 +1,38 @@
+HTML {
+    color: #222;
+    background: white;
+}
+#messages P {
+    margin: 4px 4px 4px 8px;
+}
+#messages P.server {
+    color: #888;
+}
+#messages .time {
+    margin: 0 4px;
+    padding: 0 4px;
+}
+#messages p.myself .time {
+    background: #FCC;
+    border-radius: 4px;
+}
+#messages .sender {
+    font-weight: bold;
+}
+#messages .sender:after {
+    content: ": ";
+}
+#input {
+    margin: 12px 0 0 7px;
+    border: 1px solid #CCC;
+    padding: 5px 8px;
+}
+#input input {
+    margin: 0;
+    border: none;
+    padding: 0;
+    width: 100%;
+    outline: none;
+
+    font: inherit;
+}
