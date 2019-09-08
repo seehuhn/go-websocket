@@ -110,26 +110,28 @@ func echo(conn *websocket.Conn) {
 		if err == websocket.ErrConnClosed {
 			break
 		} else if err != nil {
-			log.Println("read error", err)
+			log.Println("read error:", err)
 			break
 		}
 
 		w, err := conn.SendMessage(tp)
 		if err != nil {
-			log.Println("write error", err)
-			n, err := io.Copy(ioutil.Discard, r)
-			log.Println("discard", n, err)
+			log.Println("cannot create writer:", err)
+			// We need to read the complete message, so that the next
+			// read doesn't block.
+			io.Copy(ioutil.Discard, r)
 			break
 		}
 
-		n, err := io.Copy(w, r)
+		_, err = io.Copy(w, r)
 		if err != nil {
-			log.Println("ECHO", n, err)
+			log.Println("write error:", err)
 			io.Copy(ioutil.Discard, r)
 		}
+
 		err = w.Close()
 		if err != nil && err != websocket.ErrConnClosed {
-			log.Println("CLOSE ERROR", err)
+			log.Println("close error:", err)
 		}
 	}
 }
