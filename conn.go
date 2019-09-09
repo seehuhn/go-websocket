@@ -82,13 +82,31 @@ const (
 	StatusGoingAway           Status = 1001
 	StatusProtocolError       Status = 1002
 	StatusUnsupportedType     Status = 1003
+	StatusMissing             Status = 1005
 	StatusInvalidData         Status = 1007
 	StatusPolicyViolation     Status = 1008
 	StatusTooLarge            Status = 1009
 	StatusInternalServerError Status = 1011
-
-	statusMissing Status = 1005
 )
+
+func (code Status) isValid() bool {
+	if code >= 3000 && code < 5000 {
+		return true
+	}
+	return knownValidCode[code]
+}
+
+var knownValidCode = map[Status]bool{
+	StatusOK:              true,
+	StatusGoingAway:       true,
+	StatusProtocolError:   true,
+	StatusUnsupportedType: true,
+	StatusInvalidData:     true,
+	StatusPolicyViolation: true,
+	StatusTooLarge:        true,
+	1010:                  true, // never sent by server
+	StatusInternalServerError: true,
+}
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
 
@@ -187,7 +205,7 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 
 func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 	var buf []byte
-	if status != 0 && status != statusMissing {
+	if status != 0 && status != StatusMissing {
 		buf = make([]byte, 2+len(body))
 		buf[0] = byte(status >> 8)
 		buf[1] = byte(status)
@@ -208,28 +226,6 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 	return nil
 }
 
-var knownValidCode = map[Status]bool{
-	StatusOK:              true,
-	StatusGoingAway:       true,
-	StatusProtocolError:   true,
-	StatusUnsupportedType: true,
-	StatusInvalidData:     true,
-	StatusPolicyViolation: true,
-	StatusTooLarge:        true,
-	1010:                  true, // never sent by server
-	StatusInternalServerError: true,
-}
-
-func isValidStatus(code Status) bool {
-	if code >= 5000 {
-		return false
-	}
-	if code >= 3000 {
-		return true
-	}
-	return knownValidCode[code]
-}
-
 // Close terminates a websocket connection and frees all associated
 // resources.  The connection cannot be used any more after Close()
 // has been called.
@@ -237,12 +233,13 @@ func isValidStatus(code Status) bool {
 // The status code indicates whether the connection completed
 // successfully, or due to an error.  Use StatusOK for normal
 // termination, and one of the other status codes in case of errors.
+// Use StatusMissing to not send a status code.
 //
 // The message can be used to provide additional information for
-// debugging.  The utf-8 representation of the string must be at most
+// debugging.  The utf-8 representation of the string can be at most
 // 123 bytes long, otherwise ErrTooLarge is returned.
 func (conn *Conn) Close(code Status, message string) error {
-	if !isValidStatus(code) || code == 1010 {
+	if !code.isValid() || code == 1010 {
 		return ErrStatusCode
 	}
 

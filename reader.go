@@ -304,13 +304,13 @@ readLoop:
 			// read errors here.
 			if len(buf) >= 2 {
 				status = 256*Status(buf[0]) + Status(buf[1])
-				if isValidStatus(status) && utf8.Valid(buf[2:]) {
+				if status.isValid() && status != StatusMissing && utf8.Valid(buf[2:]) {
 					closeMessage = string(buf[2:])
 				} else {
 					status = StatusProtocolError
 				}
 			} else {
-				status = statusMissing
+				status = StatusMissing
 				closeMessage = ""
 			}
 			break readLoop
