@@ -1,15 +1,24 @@
-HTML {
+gHTML {
     color: #222;
     background: white;
 }
-#messages P {
-    margin: 4px 4px 4px 8px;
+BODY {
+    margin: 0;
+    border: none;
+    padding: 16px 4px 16px 48px;
+}
+DIV {
+    margin: 0;
+    padding: 0;
+}
+P {
+    margin: 4px 0;
 }
 #messages P.server {
     color: #888;
 }
 #messages .time {
-    margin: 0 4px;
+    margin: 0 4px 0 -36px;
     padding: 0 4px;
 }
 #messages p.myself .time {
@@ -23,7 +32,7 @@ HTML {
     content: ": ";
 }
 #input {
-    margin: 12px 0 0 7px;
+    margin: 12px 0 0 -9px;
     border: 1px solid #CCC;
     padding: 5px 8px;
 }

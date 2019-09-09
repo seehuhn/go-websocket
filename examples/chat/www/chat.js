@@ -7,10 +7,12 @@ chat.FIRST_NAMES = [
   'dancing',
   'fierce',
   'fluffy',
+  'grey',
   'hypothetical',
+  'lingering',
+  'loitering',
   'naive',
   'pink',
-  'purple',
   'singing',
   'snoozing',
   'strange'
@@ -22,19 +24,20 @@ chat.LAST_NAMES = [
   'bunny rabit',
   'contradiction',
   'crocodile',
+  'dream',
   'eel',
   'girl',
   'hippopotamus',
   'owl',
   'oxymoron',
   'philosopher',
-  'sloth',
-  'stone'
+  'rock',
+  'sloth'
 ];
 
-chat.URL = 'ws://localhost:8080/api/chat';
-
 chat.connect = function() {
+  var proto = (location.protocol == 'https:' ? 'wss:' : 'ws:')
+  chat.URL = proto + '//' + location.host + '/api/chat';
   chat.ws = new WebSocket(chat.URL);
 
   var first = chat.FIRST_NAMES[Math.floor(Math.random() * chat.FIRST_NAMES.length)];
