@@ -10,9 +10,7 @@ import (
 	"seehuhn.de/go/websocket"
 )
 
-var (
-	port = flag.String("port", "8080", "what TCP port to bind to")
-)
+var port = flag.String("port", "8080", "what TCP port to bind to")
 
 func echo(conn *websocket.Conn) {
 	defer conn.Close(websocket.StatusOK, "")

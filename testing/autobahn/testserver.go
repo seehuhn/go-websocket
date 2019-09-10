@@ -227,10 +227,10 @@ func main() {
 	l.Close()
 	<-serverDone
 
+	fmt.Println("\nIf the server hangs here, some clients didn't terminate ...")
+	wg.Wait()
+	fmt.Println("... but all turned out to be ok.")
+
 	fmt.Printf("\nThe report is in %q.\n",
 		filepath.Join(*scratch, "index.html"))
-
-	fmt.Println("\nif the server hangs here, some clients have not terminated")
-	wg.Wait()
-
 }

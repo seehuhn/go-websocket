@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"bytes"
 	"io"
-	"io/ioutil"
 	"unicode/utf8"
 )
 
@@ -50,13 +49,14 @@ func (conn *Conn) receiveLimited(ex MessageType, maxLength int) ([]byte, error) 
 
 	res := &bytes.Buffer{}
 	if tp == ex || tp == contFrame {
+		// TODO(voss): can tp == contFrame really happen?
 		_, err = io.CopyN(res, r, int64(maxLength))
 	} else {
 		err = ErrMessageType
 	}
 
-	n, e2 := io.Copy(ioutil.Discard, r)
 	if err == nil {
+		n, e2 := r.(*frameReader).Discard()
 		if n > 0 {
 			err = ErrTooLarge
 		} else {
@@ -119,7 +119,15 @@ func (r *frameReader) getNextHeader() MessageType {
 	return header.Opcode
 }
 
-func (r *frameReader) Read(buf []byte) (n int, err error) {
+// On exit of this function, at least one of the following three
+// conditions is true:
+//
+//   - r.Remaining > 0
+//   - r.Final
+//   - r.connClosed
+//
+// The function returns true, if more data is available in the message.
+func (r *frameReader) prepareRead() bool {
 	for r.Remaining == 0 {
 		if !r.confirmed {
 			r.Result <- struct{}{}
@@ -132,10 +140,43 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 
 		r.getNextHeader()
 	}
+	return r.Remaining > 0
+}
 
-	// read data from the network
-	maxLen := r.Remaining
-	if maxLen > 0 {
+// the function returns true, if reading the message is complete
+func (r *frameReader) finishRead() bool {
+	if r.Remaining == 0 && !r.confirmed {
+		r.Result <- struct{}{}
+		r.confirmed = true
+	}
+
+	if r.Remaining > 0 || !(r.Final || r.connClosed) {
+		return false
+	}
+
+	// End of message reached, return a frameReader to the channel
+	// and disable the current frameReader.
+	if r.Receive != nil {
+		newR := &frameReader{
+			Receive: r.Receive,
+			Result:  r.Result,
+			Done:    r.Done,
+			rw:      r.rw,
+		}
+		r.Done <- newR
+
+		r.Receive = nil
+		r.Result = nil
+		r.Done = nil
+		r.rw = nil
+	}
+	return true
+}
+
+func (r *frameReader) Read(buf []byte) (n int, err error) {
+	if r.prepareRead() {
+		// read data from the network
+		maxLen := r.Remaining
 		bufLen64 := uint64(len(buf))
 		if maxLen > bufLen64 {
 			maxLen = bufLen64
@@ -150,38 +191,43 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 		}
 		r.maskPos = (offs + n) % 4
 	}
-
-	if r.Remaining == 0 && !r.confirmed {
-		r.Result <- struct{}{}
-		r.confirmed = true
-	}
-
-	if r.Remaining == 0 && (r.Final || r.connClosed) {
-		if r.Receive != nil {
-			// End of message reached, return a frameReader to the channel
-			// and disable the current frameReader.
-			newR := &frameReader{
-				Receive: r.Receive,
-				Result:  r.Result,
-				Done:    r.Done,
-				rw:      r.rw,
-			}
-			r.Done <- newR
-
-			r.Receive = nil
-			r.Result = nil
-			r.Done = nil
-			r.rw = nil
-		}
-		if err == nil {
-			if r.Final {
-				err = io.EOF
-			} else if r.connClosed {
-				err = ErrConnClosed
-			}
+	if r.finishRead() && err == nil {
+		if r.Final {
+			err = io.EOF
+		} else if r.connClosed {
+			err = ErrConnClosed
 		}
 	}
 	return
+}
+
+func (r *frameReader) Discard() (uint64, error) {
+	var total uint64
+
+	// Discard in blocks, in case the remaining length does not fit
+	// into an int.
+	var blockSize uint64 = 1024 * 1024 * 1024 // 1GB
+
+	for {
+		if r.prepareRead() {
+			r64 := r.Remaining
+			if r64 > blockSize {
+				r64 = blockSize
+			}
+			n, err := r.rw.Discard(int(r64))
+			n64 := uint64(n)
+			r.Remaining -= n64
+			total += n64
+			if err != nil {
+				return total, err
+			}
+		}
+		if r.finishRead() {
+			break
+		}
+	}
+
+	return total, nil
 }
 
 // readFrameHeader reads and decodes a frame header
