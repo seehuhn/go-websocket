@@ -90,7 +90,6 @@ type frameReader struct {
 	Receive <-chan *header
 	Result  chan<- struct{}
 	Done    chan<- *frameReader
-	closed  bool
 
 	rw *bufio.ReadWriter
 
@@ -232,7 +231,7 @@ func (r *frameReader) Discard() (uint64, error) {
 
 // readFrameHeader reads and decodes a frame header
 func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
-	n, err := io.ReadFull(conn.rw, buf[:2])
+	_, err := io.ReadFull(conn.rw, buf[:2])
 	if err != nil {
 		return nil, err
 	}
@@ -278,9 +277,9 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 	}
 
 	// read the masking key
-	n, _ = io.ReadFull(conn.rw, buf[:4])
-	if n < 4 {
-		return nil, errFrameFormat
+	_, err = io.ReadFull(conn.rw, buf[:4])
+	if err != nil {
+		return nil, err
 	}
 
 	return &header{
@@ -310,8 +309,8 @@ func (conn *Conn) readMultiplexer(ready chan<- struct{}) {
 
 	close(ready)
 
-	dfChan := make(chan *header)
-	resChan := make(chan struct{})
+	dfChan := make(chan *header, 1)
+	resChan := make(chan struct{}, 1)
 	r := &frameReader{
 		Receive: dfChan,
 		Result:  resChan,
@@ -366,11 +365,11 @@ readLoop:
 				closeMessage = "read failed"
 				break readLoop
 			}
-			conn.sendControlFrame <- &frame{
-				Opcode: pongFrame,
-				Body:   buf,
-				Final:  true,
-			}
+			ctl := framePool.Get().(*frame)
+			ctl.Opcode = pongFrame
+			ctl.Body = buf
+			ctl.Final = true
+			conn.sendControlFrame <- ctl
 		case pongFrame:
 			// we don't send ping frames, so we just swallow pong frames
 			_, err := conn.readFrameBody(header)

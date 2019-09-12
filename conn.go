@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,6 +70,25 @@ const (
 
 	invalidFrame MessageType = 255
 )
+
+func (tp MessageType) String() string {
+	switch tp {
+	case Text:
+		return "text"
+	case Binary:
+		return "binary"
+	case contFrame:
+		return "continuation"
+	case closeFrame:
+		return "close"
+	case pingFrame:
+		return "ping"
+	case pongFrame:
+		return "pong"
+	default:
+		return fmt.Sprintf("MessageType(%d)", tp)
+	}
+}
 
 // Status describes the reason for the closure of a websocket
 // connection.
@@ -121,6 +141,12 @@ type frame struct {
 	Body   []byte
 	Final  bool
 	Opcode MessageType
+}
+
+var framePool = sync.Pool{
+	New: func() interface{} {
+		return new(frame)
+	},
 }
 
 func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
@@ -211,11 +237,10 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 		buf[1] = byte(status)
 		copy(buf[2:], body)
 	}
-	ctl := &frame{
-		Opcode: closeFrame,
-		Body:   buf,
-		Final:  true,
-	}
+	ctl := framePool.Get().(*frame)
+	ctl.Opcode = closeFrame
+	ctl.Body = buf
+	ctl.Final = true
 
 	conn.closeMutex.Lock()
 	defer conn.closeMutex.Unlock()

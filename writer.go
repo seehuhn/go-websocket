@@ -41,11 +41,10 @@ func (conn *Conn) sendData(opcode MessageType, data []byte) error {
 		return ErrConnClosed
 	}
 
-	msg := &frame{
-		Opcode: opcode,
-		Body:   data,
-		Final:  true,
-	}
+	msg := framePool.Get().(*frame)
+	msg.Opcode = opcode
+	msg.Body = data
+	msg.Final = true
 	w.Send <- msg
 
 	err := <-w.Result
@@ -91,11 +90,10 @@ func (w *frameWriter) Write(buf []byte) (total int, err error) {
 			return
 		}
 
-		msg := &frame{
-			Opcode: w.Opcode,
-			Body:   w.Buffer,
-			Final:  false,
-		}
+		msg := framePool.Get().(*frame)
+		msg.Opcode = w.Opcode
+		msg.Body = w.Buffer
+		msg.Final = false
 		w.Send <- msg
 
 		w.Pos = 0
@@ -109,11 +107,10 @@ func (w *frameWriter) Write(buf []byte) (total int, err error) {
 }
 
 func (w *frameWriter) Close() error {
-	msg := &frame{
-		Opcode: w.Opcode,
-		Body:   w.Buffer[:w.Pos],
-		Final:  true,
-	}
+	msg := framePool.Get().(*frame)
+	msg.Opcode = w.Opcode
+	msg.Body = w.Buffer[:w.Pos]
+	msg.Final = true
 	w.Send <- msg
 
 	err := <-w.Result
@@ -181,8 +178,8 @@ func (conn *Conn) writeMultiplexer(ready chan<- struct{}) {
 	if dataBufferSize < 512-maxHeaderSize {
 		dataBufferSize = 512 - maxHeaderSize
 	}
-	dfChan := make(chan *frame)
-	resChan := make(chan error)
+	dfChan := make(chan *frame, 1)
+	resChan := make(chan error, 1)
 	w := &frameWriter{
 		Buffer: make([]byte, dataBufferSize),
 		Send:   dfChan,
@@ -197,10 +194,17 @@ writerLoop:
 		case frame := <-dfChan:
 			err := conn.writeFrame(frame.Opcode, frame.Body, frame.Final)
 			resChan <- err
+
+			frame.Body = nil
+			framePool.Put(frame)
 		case frame := <-cfChan:
 			conn.writeFrame(frame.Opcode, frame.Body, true)
+			op := frame.Opcode
 
-			if frame.Opcode == closeFrame {
+			frame.Body = nil
+			framePool.Put(frame)
+
+			if op == closeFrame {
 				break writerLoop
 			}
 		}
@@ -212,10 +216,10 @@ writerLoop:
 drainLoop:
 	for {
 		select {
-		case _ = <-dwChan:
+		case <-dwChan:
 			close(dwChan)
 			dwChan = nil
-		case _ = <-dfChan:
+		case <-dfChan:
 			resChan <- ErrConnClosed
 		case _, ok := <-cfChan:
 			if !ok {
