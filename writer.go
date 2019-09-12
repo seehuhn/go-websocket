@@ -197,7 +197,10 @@ writerLoop:
 
 			frame.Body = nil
 			framePool.Put(frame)
-		case frame := <-cfChan:
+		case frame, ok := <-cfChan:
+			if !ok {
+				break writerLoop
+			}
 			conn.writeFrame(frame.Opcode, frame.Body, true)
 			op := frame.Opcode
 

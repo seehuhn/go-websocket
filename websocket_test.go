@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -17,7 +16,7 @@ import (
 const (
 	errTestUpgradeFailed = webSocketError("protocol upgrade failed")
 	errTestWrongLength   = webSocketError("wrong length")
-	errWrongOpcode       = webSocketError("wrong opcode")
+	errTestWrongResult   = webSocketError("wrong result")
 )
 
 type TestServer struct {
@@ -25,7 +24,7 @@ type TestServer struct {
 	listener *net.UnixListener
 }
 
-func StartTestServer() (*TestServer, error) {
+func StartTestServer(handler func(*Conn)) (*TestServer, error) {
 	nonce := make([]byte, 8)
 	_, err := rand.Read(nonce)
 	if err != nil {
@@ -45,12 +44,10 @@ func StartTestServer() (*TestServer, error) {
 
 	// start the websocket server
 	go func() {
-		log.Println("server listening")
 		websocket := &Handler{
-			Handle: echo,
+			Handle: handler,
 		}
 		http.Serve(listener, websocket)
-		log.Println("server terminated")
 	}()
 
 	return &TestServer{
@@ -226,30 +223,26 @@ func (client *TestClient) ReadFrame() (byte, uint64, error) {
 	return opcode, length, err
 }
 
-func (client *TestClient) BounceBinary(length uint64, buffer []byte) error {
+func (client *TestClient) BounceBinary(length uint64, buffer []byte,
+	checkFun func(byte, uint64) error) error {
 	readerDone := make(chan error, 1)
 	go func() {
 		var total uint64
-		var expectOp byte = 2
+		var msgType byte = 255
 		for {
 			op, n, err := client.ReadFrame()
 			total += n
+			if msgType == 255 {
+				msgType = op
+			}
 			if err == io.EOF {
 				break
 			} else if err != nil {
 				readerDone <- err
 				return
-			} else if op != expectOp {
-				readerDone <- errWrongOpcode
-				return
 			}
-			expectOp = 0
 		}
-		if total != length {
-			readerDone <- errTestWrongLength
-			return
-		}
-		readerDone <- nil
+		readerDone <- checkFun(msgType, total)
 	}()
 
 	todo := length
@@ -277,6 +270,51 @@ func (client *TestClient) BounceBinary(length uint64, buffer []byte) error {
 	return sendErr
 }
 
+func truncate(conn *Conn) {
+	status := StatusOK
+
+	for {
+		msg, err := conn.ReceiveBinary(150)
+		if err == ErrConnClosed {
+			return
+		} else if err != ErrTooLarge {
+			fmt.Println("server error:", err)
+			status = StatusProtocolError
+			break
+		}
+		err = conn.SendBinary(msg)
+		if err != nil {
+			fmt.Println("server error:", err)
+			status = StatusProtocolError
+			break
+		}
+	}
+	conn.Close(status, "")
+}
+
+func TestDiscard(t *testing.T) {
+	server, err := StartTestServer(truncate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	buf := make([]byte, 100)
+
+	for i := 0; i < 10; i++ {
+		err = client.BounceBinary(300, buf, check(150))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func echo(conn *Conn) {
 	defer conn.Close(StatusOK, "")
 
@@ -286,13 +324,13 @@ func echo(conn *Conn) {
 		if err == ErrConnClosed {
 			break
 		} else if err != nil {
-			log.Println("read error:", err)
+			fmt.Println("read error:", err)
 			break
 		}
 
 		w, err := conn.SendMessage(tp)
 		if err != nil {
-			log.Println("cannot create writer:", err)
+			fmt.Println("cannot create writer:", err)
 			// We need to read the complete message, so that the next
 			// read doesn't block.
 			io.CopyBuffer(ioutil.Discard, r, buf)
@@ -301,19 +339,54 @@ func echo(conn *Conn) {
 
 		_, err = io.CopyBuffer(w, r, buf)
 		if err != nil {
-			log.Println("write error:", err)
+			fmt.Println("write error:", err)
 			io.CopyBuffer(ioutil.Discard, r, buf)
 		}
 
 		err = w.Close()
 		if err != nil && err != ErrConnClosed {
-			log.Println("close error:", err)
+			fmt.Println("close error:", err)
 		}
 	}
 }
 
+func TestLargeMessage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
+	server, err := StartTestServer(echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	buf := make([]byte, 16*1024)
+
+	const long = 1<<32 + 1
+	err = client.BounceBinary(long, buf, check(long))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func check(l uint64) func(byte, uint64) error {
+	return func(op byte, length uint64) error {
+		if op != 2 || length != l {
+			return errTestWrongResult
+		}
+		return nil
+	}
+}
+
 func BenchmarkEcho(b *testing.B) {
-	server, err := StartTestServer()
+	server, err := StartTestServer(echo)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -328,22 +401,63 @@ func BenchmarkEcho(b *testing.B) {
 	buf := make([]byte, 16*1024)
 
 	// test whether the connection is functional
-	err = client.BounceBinary(10, buf)
+	err = client.BounceBinary(10, buf, check(10))
 	if err != nil {
-		log.Fatal(err)
+		b.Fatal(err)
 	}
 
-	for _, size := range []uint64{0, 1 << 6, 1 << 12, 1 << 18, 1 << 31} {
+	for _, size := range []uint64{0, 1 << 6, 1 << 12, 1 << 18} {
 		b.Run(fmt.Sprintf("echo%d", size), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				client.BounceBinary(size, buf)
+				client.BounceBinary(size, buf, check(size))
 			}
 		})
 	}
 
 	// test whether the connection survived the load test
-	err = client.BounceBinary(10, buf)
+	err = client.BounceBinary(10, buf, check(10))
 	if err != nil {
-		log.Fatal(err)
+		b.Fatal(err)
 	}
+}
+
+func TestStatusCode(t *testing.T) {
+	type res struct {
+		status  Status
+		message string
+	}
+	c := make(chan *res, 1)
+	handler := func(conn *Conn) {
+		_, err := conn.ReceiveText(128)
+		if err == ErrConnClosed {
+			status, message := conn.GetStatus()
+			c <- &res{status, message}
+		} else {
+			conn.Close(StatusProtocolError, "")
+			t.Error("expected ErrConnClosed, got", err)
+			c <- &res{9999, err.Error()}
+		}
+	}
+
+	server, err := StartTestServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	// case 1: dropped connection
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, message := <-c
+	if status != StatusDropped {
+		t.Error("failed to detect dropped connection")
+	}
+
+	// case 2: close frame with no status code
 }

@@ -50,8 +50,10 @@ type Conn struct {
 	getDataWriter    <-chan *frameWriter
 	sendControlFrame chan<- *frame
 
-	closeMutex sync.Mutex
-	isClosed   bool
+	closeMutex    sync.Mutex
+	isClosed      bool // indicates that we have initiated writer shutdown
+	clientStatus  Status
+	clientMessage string
 }
 
 // MessageType encodes the type of a websocket message.
@@ -102,7 +104,8 @@ const (
 	StatusGoingAway           Status = 1001
 	StatusProtocolError       Status = 1002
 	StatusUnsupportedType     Status = 1003
-	StatusMissing             Status = 1005
+	StatusNotSent             Status = 1005
+	StatusDropped             Status = 1006
 	StatusInvalidData         Status = 1007
 	StatusPolicyViolation     Status = 1008
 	StatusTooLarge            Status = 1009
@@ -231,7 +234,7 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 
 func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 	var buf []byte
-	if status != 0 && status != StatusMissing {
+	if status != 0 && status != StatusNotSent {
 		buf = make([]byte, 2+len(body))
 		buf[0] = byte(status >> 8)
 		buf[1] = byte(status)
@@ -251,6 +254,30 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 	return nil
 }
 
+// GetStatus returns the status and message the client sent when
+// closing the connection.  The returned status has the following
+// meaning:
+//
+//   - 0 indicates that the connection has not yet been closed.
+//   - StatusDropped indicates that the client dropped the connection
+//     without sending a close frame.
+//   - StatusNotSent indicates that the client sent a close frame,
+//     but did not include a valid status code.
+//   - Any other value is the status code sent by the client.
+func (conn *Conn) GetStatus() (status Status, message string) {
+	conn.closeMutex.Lock()
+	defer conn.closeMutex.Unlock()
+	if conn.isClosed {
+		status = conn.clientStatus
+		if status == 0 {
+			// no close frame has been received
+			status = StatusDropped
+		}
+		message = conn.clientMessage
+	}
+	return
+}
+
 // Close terminates a websocket connection and frees all associated
 // resources.  The connection cannot be used any more after Close()
 // has been called.
@@ -258,7 +285,7 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 // The status code indicates whether the connection completed
 // successfully, or due to an error.  Use StatusOK for normal
 // termination, and one of the other status codes in case of errors.
-// Use StatusMissing to not send a status code.
+// Use StatusNotSent to not send a status code.
 //
 // The message can be used to provide additional information for
 // debugging.  The utf-8 representation of the string can be at most
@@ -291,8 +318,8 @@ func (conn *Conn) Close(code Status, message string) error {
 	}
 
 	// The reader uses conn.sendControlFrame, so we must be sure the
-	// reader has stopped, before we can close the challer to stop the
-	// writer.
+	// reader has stopped before we can stop the writer (by closing
+	// the channel).
 	<-conn.readerDone
 
 	conn.closeMutex.Lock()

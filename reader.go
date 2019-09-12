@@ -330,6 +330,15 @@ readLoop:
 			if err == errFrameFormat {
 				status = StatusProtocolError
 			}
+
+			// connection broken, do an emergency shutdown
+			conn.closeMutex.Lock()
+			if conn.clientStatus == 0 {
+				conn.clientStatus = StatusDropped
+			}
+			close(conn.sendControlFrame)
+			conn.isClosed = true
+			conn.closeMutex.Unlock()
 			break readLoop
 		}
 
@@ -347,17 +356,25 @@ readLoop:
 			buf, _ := conn.readFrameBody(header)
 			// Since we are exiting anyway, we don't need to check for
 			// read errors here.
+			var s2 Status
 			if len(buf) >= 2 {
 				status = 256*Status(buf[0]) + Status(buf[1])
-				if status.isValid() && status != StatusMissing && utf8.Valid(buf[2:]) {
+				if status.isValid() && status != StatusNotSent && utf8.Valid(buf[2:]) {
 					closeMessage = string(buf[2:])
 				} else {
 					status = StatusProtocolError
+					s2 = StatusNotSent
 				}
 			} else {
-				status = StatusMissing
-				closeMessage = ""
+				status = StatusNotSent
 			}
+			if s2 == 0 {
+				s2 = status
+			}
+			conn.closeMutex.Lock()
+			conn.clientStatus = s2
+			conn.clientMessage = closeMessage
+			conn.closeMutex.Unlock()
 			break readLoop
 		case pingFrame:
 			buf, err := conn.readFrameBody(header)
