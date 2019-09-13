@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -130,7 +131,7 @@ func (client *TestClient) Discard(n uint64) error {
 	return nil
 }
 
-func (client *TestClient) SendFrame(buf []byte, op byte, l uint64, final bool) error {
+func (client *TestClient) MakeHeader(buf []byte, op byte, l uint64, final bool) int {
 	buf[0] = op
 	if final {
 		buf[0] |= 128
@@ -163,6 +164,20 @@ func (client *TestClient) SendFrame(buf []byte, op byte, l uint64, final bool) e
 		buf[headerLength] = 0
 		headerLength++
 	}
+	return headerLength
+}
+
+func (client *TestClient) SendFrame(op byte, body []byte) error {
+	l := len(body)
+	buf := make([]byte, l+14)
+	headerLength := client.MakeHeader(buf, op, uint64(l), true)
+	n := copy(buf[headerLength:], body)
+	_, err := client.conn.Write(buf[:headerLength+n])
+	return err
+}
+
+func (client *TestClient) SendNonsenseFrame(buf []byte, op byte, l uint64, final bool) error {
+	headerLength := client.MakeHeader(buf, op, l, final)
 
 	l += uint64(headerLength)
 	for l > 0 {
@@ -182,16 +197,16 @@ func (client *TestClient) SendFrame(buf []byte, op byte, l uint64, final bool) e
 	return nil
 }
 
-func (client *TestClient) ReadFrame() (byte, uint64, error) {
+func (client *TestClient) ReadHeader() (byte, uint64, bool, error) {
 	h1, err := client.reader.ReadByte()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, true, err
 	}
 	opcode := h1 & 15
 
 	h2, err := client.reader.ReadByte()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, true, err
 	}
 	l0 := h2 & 127
 
@@ -208,6 +223,28 @@ func (client *TestClient) ReadFrame() (byte, uint64, error) {
 		err = nil
 	}
 	if err != nil {
+		return 0, 0, true, err
+	}
+	return opcode, length, h1&128 != 0, err
+}
+
+func (client *TestClient) ReadFrame() (byte, []byte, error) {
+	opcode, length, _, err := client.ReadHeader()
+	if err != nil {
+		return opcode, nil, err
+	}
+	if length > 1024*1024 {
+		return opcode, nil, ErrTooLarge
+	}
+
+	body := make([]byte, length)
+	_, err = io.ReadFull(client.reader, body)
+	return opcode, body, err
+}
+
+func (client *TestClient) DiscardFrame() (byte, uint64, error) {
+	opcode, length, final, err := client.ReadHeader()
+	if err != nil {
 		return 0, 0, err
 	}
 
@@ -217,7 +254,7 @@ func (client *TestClient) ReadFrame() (byte, uint64, error) {
 		return 0, 0, err
 	}
 
-	if h1&128 != 0 {
+	if final {
 		err = io.EOF
 	}
 	return opcode, length, err
@@ -230,7 +267,7 @@ func (client *TestClient) BounceBinary(length uint64, buffer []byte,
 		var total uint64
 		var msgType byte = 255
 		for {
-			op, n, err := client.ReadFrame()
+			op, n, err := client.DiscardFrame()
 			total += n
 			if msgType == 255 {
 				msgType = op
@@ -255,7 +292,7 @@ func (client *TestClient) BounceBinary(length uint64, buffer []byte,
 			nextChunk = maxChunk
 		}
 
-		sendErr = client.SendFrame(buffer, op, nextChunk, nextChunk == todo)
+		sendErr = client.SendNonsenseFrame(buffer, op, nextChunk, nextChunk == todo)
 		todo -= nextChunk
 		op = 0
 		if sendErr != nil || todo == 0 {
@@ -421,7 +458,7 @@ func BenchmarkEcho(b *testing.B) {
 	}
 }
 
-func TestStatusCode(t *testing.T) {
+func TestClientStatusCode(t *testing.T) {
 	type res struct {
 		status  Status
 		message string
@@ -445,19 +482,110 @@ func TestStatusCode(t *testing.T) {
 	}
 	defer server.Close()
 
-	// case 1: dropped connection
+	type testCase struct {
+		s1 Status
+		m1 string
+		s2 Status
+		m2 string
+	}
+	cases := []*testCase{
+		&testCase{StatusOK, "good bye", StatusOK, "good bye"},
+		&testCase{4444, "good bye", 4444, "good bye"},
+		&testCase{StatusNotSent, "", StatusNotSent, ""},
+		&testCase{9999, "", StatusNotSent, ""},
+		&testCase{0, "", StatusDropped, ""},
+	}
+
+	for idx, test := range cases {
+		fmt.Println("test case", idx)
+		client, err := server.Connect()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if test.s1 > 0 {
+			var body []byte
+			if test.s1 != 1005 {
+				body = append(body, byte(test.s1>>8), byte(test.s1))
+				body = append(body, []byte(test.m1)...)
+			}
+			err = client.SendFrame(8, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opcode, resp, err := client.ReadFrame()
+			if opcode != 8 || err != nil {
+				t.Fatal(err)
+			}
+			if test.s1 == 9999 {
+				// pass
+			} else if test.s1 != 1005 {
+				if bytes.Compare(body, resp) != 0 {
+					t.Error("wrong status code/message sent by server")
+				}
+			} else if len(body) > 0 {
+				t.Error("server invented a body")
+			}
+		}
+		err = client.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverRes := <-c
+		fmt.Printf(". sent %d/%q, expected %d/%q, received %d/%q\n",
+			test.s1, test.m1, test.s2, test.m2, serverRes.status, serverRes.message)
+		if serverRes.status != test.s2 || serverRes.message != test.m2 {
+			t.Error("wrong status code/message recorded by server")
+		}
+	}
+	fmt.Println("test cases done")
+}
+
+func TestServerStatusCode(t *testing.T) {
+	type res struct {
+		status  Status
+		message string
+	}
+	c := make(chan *res, 1)
+	handler := func(conn *Conn) {
+		conn.Close(StatusOK, "penguin")
+		status, message := conn.GetStatus()
+		c <- &res{status, message}
+	}
+
+	server, err := StartTestServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
 	client, err := server.Connect()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	opcode, resp, err := client.ReadFrame()
+	if opcode != 8 || err != nil || len(resp) < 2 {
+		t.Fatal(err)
+	}
+	status := Status(resp[0])<<8 + Status(resp[1])
+	msg := string(resp[2:])
+	if status != StatusOK || msg != "penguin" {
+		t.Error("client received wrong status code/message")
+	}
+
+	err = client.SendFrame(8, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	err = client.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, message := <-c
-	if status != StatusDropped {
-		t.Error("failed to detect dropped connection")
-	}
 
-	// case 2: close frame with no status code
+	serverRes := <-c
+	if serverRes.status != StatusOK || serverRes.message != "penguin" {
+		t.Error("wrong status code/message recorded by server")
+	}
 }

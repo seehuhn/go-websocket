@@ -330,15 +330,6 @@ readLoop:
 			if err == errFrameFormat {
 				status = StatusProtocolError
 			}
-
-			// connection broken, do an emergency shutdown
-			conn.closeMutex.Lock()
-			if conn.clientStatus == 0 {
-				conn.clientStatus = StatusDropped
-			}
-			close(conn.sendControlFrame)
-			conn.isClosed = true
-			conn.closeMutex.Unlock()
 			break readLoop
 		}
 

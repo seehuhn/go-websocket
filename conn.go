@@ -51,7 +51,7 @@ type Conn struct {
 	sendControlFrame chan<- *frame
 
 	closeMutex    sync.Mutex
-	isClosed      bool // indicates that we have initiated writer shutdown
+	isClosed      bool // no more messages can be sent
 	clientStatus  Status
 	clientMessage string
 }
@@ -255,27 +255,25 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 }
 
 // GetStatus returns the status and message the client sent when
-// closing the connection.  The returned status has the following
-// meaning:
+// closing the connection.  This function blocks until the connection
+// is closed.  The returned status has the following meaning:
 //
-//   - 0 indicates that the connection has not yet been closed.
 //   - StatusDropped indicates that the client dropped the connection
 //     without sending a close frame.
 //   - StatusNotSent indicates that the client sent a close frame,
 //     but did not include a valid status code.
 //   - Any other value is the status code sent by the client.
-func (conn *Conn) GetStatus() (status Status, message string) {
+func (conn *Conn) GetStatus() (Status, string) {
+	<-conn.readerDone
+
 	conn.closeMutex.Lock()
 	defer conn.closeMutex.Unlock()
-	if conn.isClosed {
-		status = conn.clientStatus
-		if status == 0 {
-			// no close frame has been received
-			status = StatusDropped
-		}
-		message = conn.clientMessage
+	status := conn.clientStatus
+	if status == 0 {
+		// no close frame has been received
+		status = StatusDropped
 	}
-	return
+	return status, conn.clientMessage
 }
 
 // Close terminates a websocket connection and frees all associated
