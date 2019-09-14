@@ -41,5 +41,4 @@ const (
 	ErrTooLarge = webSocketError("message too large")
 
 	errFrameFormat = webSocketError("invalid frame format")
-	errFrameOpcode = webSocketError("invalid frame opcode")
 )

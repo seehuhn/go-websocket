@@ -16,7 +16,6 @@ import (
 
 const (
 	errTestUpgradeFailed = webSocketError("protocol upgrade failed")
-	errTestWrongLength   = webSocketError("wrong length")
 	errTestWrongResult   = webSocketError("wrong result")
 )
 
@@ -520,7 +519,7 @@ func TestClientStatusCode(t *testing.T) {
 			if test.s1 == 9999 {
 				// pass
 			} else if test.s1 != 1005 {
-				if bytes.Compare(body, resp) != 0 {
+				if !bytes.Equal(body, resp) {
 					t.Error("wrong status code/message sent by server")
 				}
 			} else if len(body) > 0 {

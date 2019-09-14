@@ -201,6 +201,7 @@ writerLoop:
 			if !ok {
 				break writerLoop
 			}
+			// TODO(voss): what to do, if there is a write error?
 			conn.writeFrame(frame.Opcode, frame.Body, true)
 			op := frame.Opcode
 
