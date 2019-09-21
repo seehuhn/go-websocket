@@ -128,14 +128,15 @@ func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error 
 
 	l := uint64(len(body))
 	n := 2
-	if l < 126 {
+	switch {
+	case l < 126:
 		header[1] = byte(l)
-	} else if l < (1 << 16) {
+	case l < (1 << 16):
 		header[1] = 126
 		header[2] = byte(l >> 8)
 		header[3] = byte(l)
 		n = 4
-	} else {
+	default:
 		header[1] = 127
 		header[2] = byte(l >> 56)
 		header[3] = byte(l >> 48)

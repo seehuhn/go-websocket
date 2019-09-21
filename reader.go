@@ -94,11 +94,11 @@ type frameReader struct {
 	rw *bufio.ReadWriter
 
 	// the following fields are all initialised by getNextHeader()
-	confirmed  bool
 	Remaining  uint64
-	Final      bool
 	Mask       []byte
 	maskPos    int
+	confirmed  bool
+	Final      bool
 	connClosed bool
 }
 
