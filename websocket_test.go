@@ -488,11 +488,11 @@ func TestClientStatusCode(t *testing.T) {
 		m2 string
 	}
 	cases := []*testCase{
-		&testCase{StatusOK, "good bye", StatusOK, "good bye"},
-		&testCase{4444, "good bye", 4444, "good bye"},
-		&testCase{StatusNotSent, "", StatusNotSent, ""},
-		&testCase{9999, "", StatusNotSent, ""},
-		&testCase{0, "", StatusDropped, ""},
+		{StatusOK, "good bye", StatusOK, "good bye"},
+		{4444, "good bye", 4444, "good bye"},
+		{StatusNotSent, "", StatusNotSent, ""},
+		{9999, "", StatusNotSent, ""},
+		{0, "", StatusDropped, ""},
 	}
 
 	for idx, test := range cases {
