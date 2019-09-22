@@ -21,7 +21,7 @@ import (
 )
 
 // Handler implements the http.Handler interface.  The handler
-// responds to requests, by opening a websocket connection.
+// responds to requests by opening a websocket connection.
 type Handler struct {
 	// AccessOK, if non-nil, is called during the opening handshake to
 	// decide whether the client is allowed to access the service.  At
