@@ -38,6 +38,7 @@ import (
 type Conn struct {
 	ResourceName *url.URL
 	Origin       *url.URL
+	RemoteAddr   string
 	Protocol     string
 
 	raw net.Conn
@@ -120,14 +121,14 @@ func (code Status) isValid() bool {
 }
 
 var knownValidCode = map[Status]bool{
-	StatusOK:                  true,
-	StatusGoingAway:           true,
-	StatusProtocolError:       true,
-	StatusUnsupportedType:     true,
-	StatusInvalidData:         true,
-	StatusPolicyViolation:     true,
-	StatusTooLarge:            true,
-	1010:                      true, // never sent by server
+	StatusOK:              true,
+	StatusGoingAway:       true,
+	StatusProtocolError:   true,
+	StatusUnsupportedType: true,
+	StatusInvalidData:     true,
+	StatusPolicyViolation: true,
+	StatusTooLarge:        true,
+	1010:                  true, // never sent by server
 	StatusInternalServerError: true,
 }
 
@@ -195,6 +196,7 @@ func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
 		}
 	}
 	conn.Origin = origin
+	conn.RemoteAddr = req.RemoteAddr
 
 	var protocols []string
 	protocol := strings.Join(req.Header["Sec-Websocket-Protocol"], ",")
