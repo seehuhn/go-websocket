@@ -71,7 +71,7 @@ const (
 	pingFrame  MessageType = 9
 	pongFrame  MessageType = 10
 
-	invalidFrame MessageType = 255
+	invalidFrame MessageType = 255 // internal use only
 )
 
 func (tp MessageType) String() string {

@@ -309,8 +309,9 @@ func (client *TestClient) BounceBinary(length uint64, buffer []byte,
 func truncate(conn *Conn) {
 	status := StatusOK
 
+	msg := make([]byte, 150)
 	for {
-		msg, err := conn.ReceiveBinary(150)
+		n, err := conn.ReceiveBinary(msg)
 		if err == ErrConnClosed {
 			return
 		} else if err != ErrTooLarge {
@@ -318,7 +319,7 @@ func truncate(conn *Conn) {
 			status = StatusProtocolError
 			break
 		}
-		err = conn.SendBinary(msg)
+		err = conn.SendBinary(msg[:n])
 		if err != nil {
 			fmt.Println("server error:", err)
 			status = StatusProtocolError

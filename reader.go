@@ -18,60 +18,64 @@ package websocket
 
 import (
 	"bufio"
-	"bytes"
 	"io"
 	"unicode/utf8"
 )
 
 // ReceiveBinary reads a binary message from the connection.  If the
-// next received message is not binary, ErrMessageType is returned.
-// If the length of the message body exceeds maxLength, the data is
-// truncated and ErrTooLarge is returned.
-func (conn *Conn) ReceiveBinary(maxLength int) ([]byte, error) {
-	buf, err := conn.receiveLimited(Binary, maxLength)
-	return buf, err
+// next received message is not binary, ErrMessageType is returned and
+// the received message is discarded.  If the received message is
+// longer than buf, buf contains the start of the message and
+// ErrTooLarge is returned.
+func (conn *Conn) ReceiveBinary(buf []byte) (n int, err error) {
+	return conn.receiveLimited(Binary, buf)
 }
 
 // ReceiveText reads a text message from the connection.  If the next
-// received message is not a text message, ErrMessageType is returned.
-// If the length of the utf-8 representation of the text exceeds
-// maxLength, the text is truncated and ErrTooLarge is returned.
+// received message is not a text message, ErrMessageType is returned
+// and the received message is discarded.  If the length of the utf-8
+// representation of the text exceeds maxLength, the text is truncated
+// and ErrTooLarge is returned.
 func (conn *Conn) ReceiveText(maxLength int) (string, error) {
-	buf, err := conn.receiveLimited(Text, maxLength)
-	return string(buf), err
+	buf := make([]byte, maxLength)
+	n, err := conn.receiveLimited(Text, buf)
+	return string(buf[:n]), err
 }
 
-func (conn *Conn) receiveLimited(ex MessageType, maxLength int) ([]byte, error) {
+func (conn *Conn) receiveLimited(ex MessageType, buf []byte) (n int, err error) {
 	tp, r, err := conn.ReceiveMessage()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
-	res := &bytes.Buffer{}
-	if tp == ex || tp == contFrame {
-		// TODO(voss): can tp == contFrame really happen?
-		_, err = io.CopyN(res, r, int64(maxLength))
+	if tp == ex {
+		n, err = io.ReadFull(r, buf)
 	} else {
+		// we need to discard the message before bailing out
 		err = ErrMessageType
 	}
 
-	if err == nil {
-		n, e2 := r.(*frameReader).Discard()
-		if n > 0 {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		err = nil
+	} else {
+		n2, e2 := r.(*frameReader).Discard()
+		if err == nil && n2 > 0 {
 			err = ErrTooLarge
-		} else {
+		} else if err == nil {
 			err = e2
 		}
-	} else if err == io.EOF {
-		err = nil
 	}
 
-	return res.Bytes(), err
+	return n, err
 }
 
 // ReceiveMessage returns an io.Reader which can be used to read the
 // next message from the connection.  The first return value gives the
 // message type received (Text or Binary).
+//
+// No more messages can be received until the returned io.Reader has
+// been read till the end.  In order to avoid deadlocks, the reader
+// must always be completely drained.
 func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 	r := <-conn.getDataReader
 	if r == nil {
