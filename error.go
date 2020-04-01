@@ -29,7 +29,7 @@ const (
 
 	// ErrMessageType indicates that an invalid message type has been
 	// encountered.  Valid message types are Text and Binary.
-	ErrMessageType = webSocketError("wrong message type")
+	ErrMessageType = webSocketError("invalid message type")
 
 	// ErrStatusCode indicates that an invalid status code has been
 	// supplied.  Valid status codes are in the range from 1000 to
@@ -37,7 +37,7 @@ const (
 	ErrStatusCode = webSocketError("invalid status code")
 
 	// ErrTooLarge is used by ReceiveBinary and ReceiveText to
-	// indicate that the client send a too large message.
+	// indicate that the client sent a too large message.
 	ErrTooLarge = webSocketError("message too large")
 
 	errFrameFormat = webSocketError("invalid frame format")

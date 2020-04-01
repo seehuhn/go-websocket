@@ -31,11 +31,10 @@ func (conn *Conn) ReceiveBinary(buf []byte) (n int, err error) {
 	return conn.receiveLimited(Binary, buf)
 }
 
-// ReceiveText reads a text message from the connection.  If the next
-// received message is not a text message, ErrMessageType is returned
-// and the received message is discarded.  If the length of the utf-8
-// representation of the text exceeds maxLength, the text is truncated
-// and ErrTooLarge is returned.
+// ReceiveText reads a text message from the connection.  If the next received
+// message is not a text message, ErrMessageType is returned and the received
+// message is discarded.  If the length of the utf-8 representation of the text
+// exceeds maxLength bytes, the text is truncated and ErrTooLarge is returned.
 func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 	buf := make([]byte, maxLength)
 	n, err := conn.receiveLimited(Text, buf)

@@ -28,6 +28,8 @@ func (conn *Conn) SendText(msg string) error {
 }
 
 // SendBinary sends a binary message to the client.
+//
+// For streaming large messages, use SendMessage() instead.
 func (conn *Conn) SendBinary(msg []byte) error {
 	return conn.sendData(Binary, msg)
 }
