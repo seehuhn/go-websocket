@@ -121,18 +121,16 @@ func (code Status) isValid() bool {
 }
 
 var knownValidCode = map[Status]bool{
-	StatusOK:              true,
-	StatusGoingAway:       true,
-	StatusProtocolError:   true,
-	StatusUnsupportedType: true,
-	StatusInvalidData:     true,
-	StatusPolicyViolation: true,
-	StatusTooLarge:        true,
-	1010:                  true, // never sent by server
+	StatusOK:                  true,
+	StatusGoingAway:           true,
+	StatusProtocolError:       true,
+	StatusUnsupportedType:     true,
+	StatusInvalidData:         true,
+	StatusPolicyViolation:     true,
+	StatusTooLarge:            true,
+	1010:                      true, // never sent by server
 	StatusInternalServerError: true,
 }
-
-const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
 
 type header struct {
 	Length uint64

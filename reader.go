@@ -156,7 +156,7 @@ func (r *frameReader) finishRead() bool {
 		return false
 	}
 
-	// End of message reached, return a frameReader to the channel
+	// End of message reached, return a new frameReader to the channel
 	// and disable the current frameReader.
 	if r.Receive != nil {
 		newR := &frameReader{

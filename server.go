@@ -55,6 +55,8 @@ type Handler struct {
 	ServerName string
 }
 
+const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
+
 func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
