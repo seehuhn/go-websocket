@@ -125,6 +125,7 @@ var knownValidCode = map[Status]bool{
 	StatusGoingAway:           true,
 	StatusProtocolError:       true,
 	StatusUnsupportedType:     true,
+	StatusNotSent:             true,
 	StatusInvalidData:         true,
 	StatusPolicyViolation:     true,
 	StatusTooLarge:            true,
