@@ -50,7 +50,8 @@ func StartTestServer(handler func(*Conn)) (*TestServer, error) {
 		websocket := &Handler{
 			Handle: handler,
 		}
-		http.Serve(listener, websocket)
+		// errors are expected here, when we shut down the server
+		_ = http.Serve(listener, websocket)
 	}()
 
 	return &TestServer{
@@ -383,88 +384,6 @@ func TestClientToServer(t *testing.T) {
 	}
 }
 
-// TestDiscard tests that too long messages are correctly processed
-// on the server side.
-func TestDiscard(t *testing.T) {
-	var serverError string
-	server, err := StartTestServer(func(conn *Conn) {
-		// We send messages of 300 bytes length, but only use a buffer of 150
-		// bytes.  Make sure ErrTooLarge is reported.
-		msg := make([]byte, 150)
-		status := StatusOK
-		for {
-			n, err := conn.ReceiveBinary(msg)
-			if err == ErrConnClosed {
-				return
-			} else if err != ErrTooLarge {
-				serverError = "errTooLarge not reported"
-				status = StatusProtocolError
-				break
-			}
-			err = conn.SendBinary(msg[:n])
-			if err != nil {
-				serverError = "server error: " + err.Error()
-				status = StatusProtocolError
-				break
-			}
-		}
-		conn.Close(status, "")
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-
-	client, err := server.Connect()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	buf := make([]byte, 100)
-	for i := 0; i < 10; i++ {
-		// Repeat the test, to make sure that the server drains the unread
-		// part of the message and does not hang.
-		err = client.BounceBinary(300, buf, binaryLengthCheck(150))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	err = client.Close()
-	if err != nil {
-		t.Error(err)
-	}
-	if serverError != "" {
-		t.Error(serverError)
-	}
-}
-
-func TestLargeMessage(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping test in short mode.")
-	}
-
-	server, err := StartTestServer(echo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-
-	client, err := server.Connect()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	buf := make([]byte, 16*1024)
-
-	const long = 1<<32 + 1
-	err = client.BounceBinary(long, buf, binaryLengthCheck(long))
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestClientStatusCode(t *testing.T) {
 	type res struct {
 		status  Status
@@ -503,8 +422,7 @@ func TestClientStatusCode(t *testing.T) {
 		{0, "", StatusDropped, ""},
 	}
 
-	for idx, test := range cases {
-		fmt.Println("test case", idx)
+	for _, test := range cases {
 		client, err := server.Connect()
 		if err != nil {
 			t.Fatal(err)
@@ -539,8 +457,6 @@ func TestClientStatusCode(t *testing.T) {
 			t.Fatal(err)
 		}
 		serverRes := <-c
-		fmt.Printf(". sent %d/%q, expected %d/%q, received %d/%q\n",
-			test.s1, test.m1, test.s2, test.m2, serverRes.status, serverRes.message)
 		if serverRes.status != test.s2 || serverRes.message != test.m2 {
 			t.Error("wrong status code/message recorded by server")
 		}
@@ -597,6 +513,115 @@ func TestServerStatusCode(t *testing.T) {
 	}
 }
 
+// TestDiscard tests that too long messages are correctly processed
+// on the server side.
+func TestDiscard(t *testing.T) {
+	var serverError string
+	server, err := StartTestServer(func(conn *Conn) {
+		// We send messages of 300 bytes length, but only use a buffer of 150
+		// bytes.  Make sure ErrTooLarge is reported.
+		msg := make([]byte, 150)
+		status := StatusOK
+		for {
+			n, err := conn.ReceiveBinary(msg)
+			if err == ErrConnClosed {
+				return
+			} else if err != ErrTooLarge {
+				serverError = "errTooLarge not reported"
+				status = StatusProtocolError
+				break
+			}
+			err = conn.SendBinary(msg[:n])
+			if err != nil {
+				serverError = "server error: " + err.Error()
+				status = StatusProtocolError
+				break
+			}
+		}
+		conn.Close(status, "")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 100)
+	for i := 0; i < 10; i++ {
+		// Repeat the test, to make sure that the server drains the unread
+		// part of the message and does not hang.
+		err = client.BounceBinary(300, buf, binaryLengthCheck(150))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = client.Close()
+	if err != nil {
+		t.Error(err)
+	}
+	if serverError != "" {
+		t.Error(serverError)
+	}
+}
+
+// TestLargeMessage tests whether large messages are transmitted correctly.
+func TestLargeMessage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
+	server, err := StartTestServer(echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	buf := make([]byte, 16*1024)
+
+	const long = 1<<32 + 1
+	err = client.BounceBinary(long, buf, binaryLengthCheck(long))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestKeepConn tests whether Conn can be used after the handler has
+// terminated.
+func TestKeepConn(t *testing.T) {
+	keep := make(chan *Conn, 1)
+	server, err := StartTestServer(func(c *Conn) {
+		keep <- c
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	go echo(<-keep)
+
+	buf := make([]byte, 64)
+	err = client.BounceBinary(17, buf, binaryLengthCheck(17))
+	if err != nil {
+		t.Error(err)
+	}
+}
+
 func BenchmarkEcho(b *testing.B) {
 	server, err := StartTestServer(echo)
 	if err != nil {
@@ -621,7 +646,7 @@ func BenchmarkEcho(b *testing.B) {
 	for _, size := range []uint64{0, 1 << 6, 1 << 12, 1 << 18} {
 		b.Run(fmt.Sprintf("echo%d", size), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				client.BounceBinary(size, buf, binaryLengthCheck(size))
+				_ = client.BounceBinary(size, buf, binaryLengthCheck(size))
 			}
 		})
 	}
@@ -651,14 +676,20 @@ func echo(conn *Conn) {
 			fmt.Println("cannot create writer:", err)
 			// We need to read the complete message, so that the next
 			// read doesn't block.
-			io.CopyBuffer(ioutil.Discard, r, buf)
+			_, err = io.CopyBuffer(ioutil.Discard, r, buf)
+			if err != nil {
+				fmt.Println("discard error:", err)
+			}
 			break
 		}
 
 		_, err = io.CopyBuffer(w, r, buf)
 		if err != nil {
 			fmt.Println("write error:", err)
-			io.CopyBuffer(ioutil.Discard, r, buf)
+			_, err = io.CopyBuffer(ioutil.Discard, r, buf)
+			if err != nil {
+				fmt.Println("discard error:", err)
+			}
 		}
 
 		err = w.Close()

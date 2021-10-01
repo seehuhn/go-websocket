@@ -401,7 +401,9 @@ readLoop:
 	// Sending a close response unconditionally is safe,
 	// since the server will ignore everything after it has
 	// sent a close message once.
-	conn.sendCloseFrame(status, []byte(closeMessage))
+	//
+	// Since we are exiting anyway, we don't care about errors here.
+	_ = conn.sendCloseFrame(status, []byte(closeMessage))
 
 	close(readerDone)
 }
