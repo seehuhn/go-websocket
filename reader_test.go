@@ -56,20 +56,20 @@ func TestReadBinary(t *testing.T) {
 	defer client.Close()
 
 	// send one byte
-	err = client.SendFrame(byte(Binary), []byte{1})
+	err = client.SendFrame(Binary, []byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// wrong message type, in several packets - should be discarded
 	tmp := make([]byte, 128)
-	var tp = byte(Text)
+	var tp = Text
 	for i := 0; i < 10; i++ {
 		err = client.SendNonsenseFrame(tmp, tp, 100, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		tp = byte(contFrame)
+		tp = contFrame
 	}
 	err = client.SendNonsenseFrame(tmp, tp, 29, true)
 	if err != nil {
@@ -77,19 +77,19 @@ func TestReadBinary(t *testing.T) {
 	}
 
 	// send one byte
-	err = client.SendFrame(byte(Binary), []byte{3})
+	err = client.SendFrame(Binary, []byte{3})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// too long message
-	err = client.SendFrame(byte(Binary), []byte{4, 4, 4, 4})
+	err = client.SendFrame(Binary, []byte{4, 4, 4, 4})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// send one byte
-	err = client.SendFrame(byte(Binary), []byte{5})
+	err = client.SendFrame(Binary, []byte{5})
 	if err != nil {
 		t.Error(err)
 	}
