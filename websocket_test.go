@@ -3,6 +3,7 @@ package websocket
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -461,7 +462,6 @@ func TestClientStatusCode(t *testing.T) {
 			t.Error("wrong status code/message recorded by server")
 		}
 	}
-	fmt.Println("test cases done")
 }
 
 func TestServerStatusCode(t *testing.T) {
@@ -619,6 +619,61 @@ func TestKeepConn(t *testing.T) {
 	err = client.BounceBinary(17, buf, binaryLengthCheck(17))
 	if err != nil {
 		t.Error(err)
+	}
+}
+
+func TestBroadcast(t *testing.T) {
+	// connect some clients to a server and collect the connections
+	numClient := 10
+	connections := make(chan *Conn, numClient)
+	server, err := StartTestServer(func(c *Conn) {
+		connections <- c
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clients := make([]*TestClient, numClient)
+	for i := 0; i < numClient; i++ {
+		clients[i], err = server.Connect()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cc := make([]*Conn, numClient)
+	for i := 0; i < numClient; i++ {
+		cc[i] = <-connections
+	}
+
+	// send a broadcast message in the background, and then collect
+	// the received messages from the clients.
+	testMsg := "hello there"
+	broadcastResult := make(chan []BroadcastError, 1)
+	go func() {
+		errors := BroadcastText(context.Background(), testMsg, cc)
+		broadcastResult <- errors
+	}()
+
+	for i := 0; i < numClient; i++ {
+		tp, msg, err := clients[i].ReadFrame()
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		if tp != Text {
+			t.Error("wrong message type")
+			continue
+		}
+		if string(msg) != testMsg {
+			t.Error("wrong message")
+		}
+	}
+
+	errors := <-broadcastResult
+	if len(errors) > 0 {
+		t.Error(errors[0].Error)
 	}
 }
 
