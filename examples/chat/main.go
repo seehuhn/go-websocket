@@ -19,6 +19,7 @@ package main
 import (
 	"embed"
 	"flag"
+	"io/fs"
 	"log"
 	"net/http"
 
@@ -33,7 +34,12 @@ var listenAddr = flag.String("port", ":8080", "the address to listen on")
 func main() {
 	flag.Parse()
 
-	http.Handle("/", http.FileServer(http.FS(www)))
+	staticFiles, err := fs.Sub(www, "www")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	http.Handle("/", http.FileServer(http.FS(staticFiles)))
 	chat := NewChat()
 	websocketHandler := &websocket.Handler{
 		Handle: func(conn *websocket.Conn) { chat.Add(conn) },

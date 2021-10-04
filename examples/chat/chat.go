@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,18 +28,213 @@ import (
 	"seehuhn.de/go/websocket"
 )
 
+// Chat represent one chat server.
 type Chat struct {
 	send chan<- *Message
 
 	sync.Mutex
-	clients map[string]*Client
+	change  *sync.Cond
+	members *members
 }
 
-type Client struct {
-	name string
-	conn *websocket.Conn
+// NewChat creates a new Chat objects and starts the associated goroutines.
+func NewChat() *Chat {
+	c := make(chan *Message, 1)
+	chat := &Chat{
+		send:    c,
+		members: &members{},
+	}
+	chat.change = sync.NewCond(&chat.Mutex)
+
+	go chat.broadcastMessages(c)
+	return chat
 }
 
+func (chat *Chat) receiveMessages(ctl <-chan struct{}) {
+	c := make(chan *members, 1)
+	currentMembers := make(chan *members, 1)
+
+	go func() {
+		chat.Lock()
+		for {
+			chat.change.Wait()
+			next := chat.members.Copy()
+			c <- next
+		}
+		chat.Unlock()
+		close(c)
+	}()
+
+	currentMembers <- <-c
+	for members := range currentMembers {
+		ctx, abortReceive := context.WithCancel(context.Background())
+		go func() {
+			// When an updated members list is available, abort the current read.
+			next := <-c
+			abortReceive()
+			currentMembers <- next
+		}()
+		for {
+			idx, msgText, err := websocket.ReceiveOneText(ctx, 1024, members.conns)
+			if idx < 0 {
+				// updated members list
+				break
+			}
+
+			conn := members.conns[idx]
+			name := members.names[idx]
+			switch {
+			case msgText == "/quit":
+				err := conn.Close(websocket.StatusOK, "quit request received")
+				if err != nil {
+					log.Println("close error:", err)
+				}
+				fallthrough
+			case err != nil:
+				chat.Remove(conn)
+				chat.send <- &Message{
+					When: time.Now(),
+					Text: fmt.Sprintf("%q has left this chat", name),
+				}
+			case msgText == "/names":
+				chat.send <- &Message{
+					When: time.Now(),
+					Text: "members: " + strings.Join(members.names, ", "),
+				}
+			default:
+				chat.send <- &Message{
+					When: time.Now(),
+					From: name,
+					Text: msgText,
+				}
+			}
+		}
+	}
+}
+
+func (chat *Chat) broadcastMessages(messages <-chan *Message) {
+	for msg := range messages {
+		msgJSON, err := msg.asJSON()
+		if err != nil {
+			log.Println("JSON encoding failed:", err)
+			continue
+		}
+
+		chat.Lock()
+		var closed []int
+		for i, conn := range chat.members.conns {
+			err = conn.SendText(msgJSON)
+			if err == websocket.ErrConnClosed {
+				closed = append(closed, i)
+			} else if err != nil {
+				log.Printf("sending failed for %q: %s\n", chat.members.names[i], err)
+			}
+		}
+		var needsCloseConn []*websocket.Conn
+		var needsCloseName []string
+		if len(closed) > 0 {
+			members := chat.members
+			n := len(members.conns)
+			for i := len(closed) - 1; i >= 0; i-- {
+				idx := closed[i]
+				needsCloseConn = append(needsCloseConn, members.conns[idx])
+				needsCloseName = append(needsCloseName, members.names[idx])
+
+				n--
+				if idx < n {
+					members.conns[idx] = members.conns[n]
+					members.names[idx] = members.names[n]
+				}
+			}
+			members.conns = members.conns[:n]
+			members.names = members.names[:n]
+			chat.change.Broadcast()
+		}
+		chat.Unlock()
+
+		for i, conn := range needsCloseConn {
+			conn.Close(websocket.StatusOK, "")
+			log.Printf("member %q disconnected", needsCloseName[i])
+		}
+	}
+}
+
+// Add adds a new member to the chat.
+func (chat *Chat) Add(conn *websocket.Conn) {
+	msg, err := conn.ReceiveText(64)
+	parts := strings.Fields(msg)
+	if err != nil || len(parts) < 2 || parts[0] != "CHAT" {
+		log.Println("new member: connect failed,", err)
+		conn.Close(websocket.StatusProtocolError, "")
+		return
+	}
+	name := strings.Join(parts[1:], " ")
+
+	chat.Lock()
+	alreadyPresent := false
+	for _, existing := range chat.members.names {
+		if name == existing {
+			alreadyPresent = true
+			break
+		}
+	}
+	if !alreadyPresent {
+		chat.members.names = append(chat.members.names, name)
+		chat.members.conns = append(chat.members.conns, conn)
+		chat.change.Broadcast()
+	}
+	chat.Unlock()
+
+	if alreadyPresent {
+		log.Printf("name %q already in use, new member not connected", name)
+		conn.Close(websocket.StatusInvalidData, "name already in use")
+		return
+	}
+	log.Printf("member %q connected", name)
+	chat.send <- &Message{
+		When: time.Now(),
+		Text: fmt.Sprintf("%q has joined this chat", name),
+	}
+}
+
+// Remove a member from the chat.
+func (chat *Chat) Remove(conn *websocket.Conn) {
+	chat.Lock()
+	idx := -1
+	for i, memberConn := range chat.members.conns {
+		if memberConn == conn {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		n := len(chat.members.conns) - 1
+		if idx < n {
+			chat.members.conns[idx] = chat.members.conns[n]
+			chat.members.names[idx] = chat.members.names[n]
+		}
+		chat.members.conns = chat.members.conns[:n]
+		chat.members.names = chat.members.names[:n]
+	}
+	chat.Unlock()
+}
+
+type members struct {
+	names []string
+	conns []*websocket.Conn
+}
+
+func (m *members) Copy() *members {
+	res := &members{
+		names: make([]string, len(m.names)),
+		conns: make([]*websocket.Conn, len(m.conns)),
+	}
+	copy(res.names, m.names)
+	copy(res.conns, m.conns)
+	return res
+}
+
+// Message represents a text which is distributed to all chat members.
 type Message struct {
 	When time.Time
 	From string
@@ -51,115 +247,4 @@ func (msg *Message) asJSON() (string, error) {
 		return "", err
 	}
 	return string(msgJSONBytes), nil
-}
-
-func NewChat() *Chat {
-	c := make(chan *Message, 1)
-	chat := &Chat{
-		send:    c,
-		clients: make(map[string]*Client),
-	}
-	go chat.handler(c)
-	return chat
-}
-
-func (chat *Chat) handler(messages <-chan *Message) {
-	for msg := range messages {
-		msgJSON, err := msg.asJSON()
-		if err != nil {
-			log.Println("JSON encoding failed:", err)
-			continue
-		}
-
-		chat.Lock()
-		var closed []*Client
-		for name, client := range chat.clients {
-			err = client.conn.SendText(msgJSON)
-			if err == websocket.ErrConnClosed {
-				closed = append(closed, client)
-			} else if err != nil {
-				log.Printf("sending failed for %q: %s\n", name, err)
-			}
-		}
-		for _, client := range closed {
-			delete(chat.clients, client.name)
-		}
-		chat.Unlock()
-
-		for _, client := range closed {
-			client.conn.Close(websocket.StatusOK, "")
-			log.Printf("client %q disconnected", client.name)
-		}
-	}
-}
-
-func (chat *Chat) Add(conn *websocket.Conn) {
-	msg, err := conn.ReceiveText(64)
-	parts := strings.Fields(msg)
-	if err != nil || len(parts) < 2 || parts[0] != "CHAT" {
-		log.Println("new client: connect failed,", err)
-		conn.Close(websocket.StatusProtocolError, "")
-		return
-	}
-	name := strings.Join(parts[1:], " ")
-
-	client := &Client{
-		name: name,
-		conn: conn,
-	}
-	chat.Lock()
-	_, alreadyPresent := chat.clients[name]
-	if !alreadyPresent {
-		chat.clients[name] = client
-	}
-	chat.Unlock()
-	if alreadyPresent {
-		log.Printf("name %q already in use, new client not connected", name)
-		conn.Close(websocket.StatusInvalidData, "name already in use")
-		return
-	}
-	log.Printf("client %q connected", name)
-	chat.send <- &Message{
-		When: time.Now(),
-		Text: fmt.Sprintf("%q has joined this chat", name),
-	}
-
-	go func() {
-		log.Printf("reader thread for %q started", name)
-		for {
-			msgText, err := conn.ReceiveText(1024)
-			if err != nil {
-				break
-			}
-			if msgText == "/quit" {
-				err := conn.Close(websocket.StatusOK, "quit request received")
-				if err != nil {
-					log.Println("close error:", err)
-				}
-			} else if msgText == "/names" {
-				var names []string
-				chat.Lock()
-				for name := range chat.clients {
-					names = append(names, name)
-				}
-				chat.Unlock()
-
-				chat.send <- &Message{
-					When: time.Now(),
-					Text: "members: " + strings.Join(names, ", "),
-				}
-			} else {
-				chat.send <- &Message{
-					When: time.Now(),
-					From: name,
-					Text: msgText,
-				}
-			}
-		}
-		chat.send <- &Message{
-			When: time.Now(),
-			Text: fmt.Sprintf("%q has left this chat", name),
-		}
-		log.Printf("reader thread for %q stopped", name)
-	}()
 }

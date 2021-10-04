@@ -87,6 +87,10 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 // ErrMessageType is returned and the received message is discarded.  If the
 // received message is longer than buf, buf contains the start of the message
 // and ErrTooLarge is returned.
+//
+// If the context expires or is cancelled, -1 is returned for the
+// connection index, and the error is either context.Cancelled or
+// context.DeadlineExceeded.
 func ReceiveOneBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int, err error) {
 	return receiveOneLimited(ctx, Binary, buf, clients)
 }
@@ -96,6 +100,10 @@ func ReceiveOneBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n 
 // ErrMessageType is returned and the received message is discarded.  If the
 // length of the utf-8 representation of the text exceeds maxLength bytes, the
 // text is truncated and ErrTooLarge is returned.
+//
+// If the context expires or is cancelled, -1 is returned for the
+// connection index, and the error is either context.Cancelled or
+// context.DeadlineExceeded.
 func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (int, string, error) {
 	buf := make([]byte, maxLength)
 	idx, n, err := receiveOneLimited(ctx, Text, buf, clients)
@@ -110,7 +118,7 @@ func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (int, s
 // io.Reader has been read till the end.  In order to avoid deadlocks, the
 // reader must always be completely drained.
 //
-// If the context expires or is cancelled, the -1 is returned for the
+// If the context expires or is cancelled, -1 is returned for the
 // connection index, and the error is either context.Cancelled or
 // context.DeadlineExceeded.
 func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, io.Reader, error) {
