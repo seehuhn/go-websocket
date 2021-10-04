@@ -18,7 +18,9 @@ package websocket
 
 import (
 	"bufio"
+	"context"
 	"io"
+	"reflect"
 	"unicode/utf8"
 )
 
@@ -41,20 +43,20 @@ func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 	return string(buf[:n]), err
 }
 
-func (conn *Conn) receiveLimited(ex MessageType, buf []byte) (n int, err error) {
+func (conn *Conn) receiveLimited(want MessageType, buf []byte) (n int, err error) {
 	tp, r, err := conn.ReceiveMessage()
 	if err != nil {
 		return 0, err
 	}
 
-	if tp == ex {
+	if tp == want {
 		n, err = io.ReadFull(r, buf)
 	} else {
 		// we need to discard the message before bailing out
 		err = ErrMessageType
 	}
 
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
+	if n > 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
 		err = nil
 	} else {
 		n2, e2 := r.(*frameReader).Discard()
@@ -77,16 +79,85 @@ func (conn *Conn) receiveLimited(ex MessageType, buf []byte) (n int, err error) 
 // must always be completely drained.
 func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 	r := <-conn.getDataReader
-	if r == nil {
-		return 0, nil, ErrConnClosed
+	return r.doReceive()
+}
+
+// ReceiveOneBinary listens on all connections until a new message arrives,
+// and returns this message.  If the next received message is not binary,
+// ErrMessageType is returned and the received message is discarded.  If the
+// received message is longer than buf, buf contains the start of the message
+// and ErrTooLarge is returned.
+func ReceiveOneBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int, err error) {
+	return receiveOneLimited(ctx, Binary, buf, clients)
+}
+
+// ReceiveOneText listens on all connections until a new message arrives, and
+// returns this message.  If the next received message is not a text message,
+// ErrMessageType is returned and the received message is discarded.  If the
+// length of the utf-8 representation of the text exceeds maxLength bytes, the
+// text is truncated and ErrTooLarge is returned.
+func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (int, string, error) {
+	buf := make([]byte, maxLength)
+	idx, n, err := receiveOneLimited(ctx, Text, buf, clients)
+	return idx, string(buf[:n]), err
+}
+
+// ReceiveOneMessage listens on all connections until a new message arrives.
+// The function returns the index of the connection, the message type, and a
+// reader which can be used to read the message contents.
+//
+// No more messages can be received on this connection until the returned
+// io.Reader has been read till the end.  In order to avoid deadlocks, the
+// reader must always be completely drained.
+//
+// If the context expires or is cancelled, the -1 is returned for the
+// connection index, and the error is either context.Cancelled or
+// context.DeadlineExceeded.
+func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, io.Reader, error) {
+	numClients := len(clients)
+	cases := make([]reflect.SelectCase, numClients+1)
+	for i, conn := range clients {
+		cases[i] = reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(conn.getDataReader),
+		}
+	}
+	cases[numClients] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(ctx.Done()),
 	}
 
-	opcode := r.getNextHeader()
-	if opcode == invalidFrame {
-		r.Done <- r
-		return 0, nil, ErrConnClosed
+	idx, frValue, _ := reflect.Select(cases)
+	if idx == numClients {
+		return -1, 0, nil, ctx.Err()
 	}
-	return opcode, r, nil
+
+	fr := frValue.Interface().(*frameReader)
+	tp, r, err := fr.doReceive()
+	return idx, tp, r, err
+}
+
+func receiveOneLimited(ctx context.Context, want MessageType, buf []byte, clients []*Conn) (idx, n int, err error) {
+	idx, tp, r, err := ReceiveOneMessage(ctx, clients)
+
+	if tp == want {
+		n, err = io.ReadFull(r, buf)
+	} else {
+		// we need to discard the message before bailing out
+		err = ErrMessageType
+	}
+
+	if n > 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+		err = nil
+	} else {
+		n2, e2 := r.(*frameReader).Discard()
+		if err == nil && n2 > 0 {
+			err = ErrTooLarge
+		} else if err == nil {
+			err = e2
+		}
+	}
+	return idx, n, err
 }
 
 type frameReader struct {
@@ -98,11 +169,24 @@ type frameReader struct {
 
 	// the following fields are all initialised by getNextHeader()
 	Remaining  uint64
-	Mask       []byte
+	Mask       [4]byte
 	maskPos    int
 	confirmed  bool
 	Final      bool
 	connClosed bool
+}
+
+func (r *frameReader) doReceive() (MessageType, io.Reader, error) {
+	if r == nil {
+		return 0, nil, ErrConnClosed
+	}
+
+	opcode := r.getNextHeader()
+	if opcode == invalidFrame {
+		r.Done <- r
+		return 0, nil, ErrConnClosed
+	}
+	return opcode, r, nil
 }
 
 func (r *frameReader) getNextHeader() MessageType {
@@ -285,12 +369,14 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 		return nil, err
 	}
 
-	return &header{
+	h := &header{
 		Final:  final != 0,
 		Opcode: MessageType(opcode),
 		Length: length,
-		Mask:   buf[:4],
-	}, nil
+	}
+	copy(h.Mask[:], buf[:4])
+
+	return h, nil
 }
 
 func (conn *Conn) readFrameBody(header *header) ([]byte, error) {

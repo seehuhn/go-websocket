@@ -81,15 +81,15 @@ func broadcastData(ctx context.Context, opcode MessageType, data []byte, clients
 	// here may be a solution:
 	// https://cyolo.io/blog/how-we-enabled-dynamic-channel-selection-at-scale-in-go/
 
-	n := len(clients)
-	cases := make([]reflect.SelectCase, n+1)
+	numClients := len(clients)
+	cases := make([]reflect.SelectCase, numClients+1)
 	for i, conn := range clients {
 		cases[i] = reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
 			Chan: reflect.ValueOf(conn.getDataWriter),
 		}
 	}
-	cases[n] = reflect.SelectCase{
+	cases[numClients] = reflect.SelectCase{
 		Dir:  reflect.SelectRecv,
 		Chan: reflect.ValueOf(ctx.Done()),
 	}
@@ -99,7 +99,7 @@ func broadcastData(ctx context.Context, opcode MessageType, data []byte, clients
 	for todo > 0 {
 		i, recv, recvOK := reflect.Select(cases)
 
-		if i == n { // the context was cancelled
+		if i == numClients { // the context was cancelled
 			errors = append(errors, BroadcastError{
 				Error: ctx.Err(),
 			})

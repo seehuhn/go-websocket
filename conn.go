@@ -135,7 +135,7 @@ var knownValidCode = map[Status]bool{
 
 type header struct {
 	Length uint64
-	Mask   []byte
+	Mask   [4]byte
 	Final  bool
 	Opcode MessageType
 }
