@@ -47,7 +47,7 @@ type Conn struct {
 	readerDone <-chan struct{}
 	writerDone <-chan struct{}
 
-	getDataReader    <-chan *frameReader
+	getFrameReader   <-chan *frameReader
 	getDataWriter    <-chan *frameWriter
 	sendControlFrame chan<- *frame
 

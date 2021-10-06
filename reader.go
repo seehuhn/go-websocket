@@ -79,16 +79,16 @@ func (conn *Conn) receiveLimited(want MessageType, buf []byte) (n int, err error
 // been read till the end.  In order to avoid deadlocks, the reader
 // must always be completely drained.
 func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
-	r := <-conn.getDataReader
+	r := <-conn.getFrameReader
 	if r == nil {
 		return 0, nil, ErrConnClosed
 	}
 
-	header := <-r.Receive
+	header := <-r.GetHeader
 	if header == nil {
 		r.confirmed = true
 		r.connClosed = true
-		r.Done <- r
+		r.MessageDone <- r
 		return 0, nil, ErrConnClosed
 	}
 
@@ -174,7 +174,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 	for i, conn := range clients {
 		cases[i] = reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(conn.getDataReader),
+			Chan: reflect.ValueOf(conn.getFrameReader),
 		}
 	}
 	done := ctx.Done()
@@ -217,7 +217,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 
 			// Switch to listening for the first packet on this reader.
 			readers[idx] = fr
-			cases[idx].Chan = reflect.ValueOf(fr.Receive)
+			cases[idx].Chan = reflect.ValueOf(fr.GetHeader)
 		} else {
 			// We received data on a reader.
 
@@ -226,7 +226,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 			if header == nil {
 				r.confirmed = true
 				r.connClosed = true
-				r.Done <- r
+				r.MessageDone <- r
 				idxError = ErrConnClosed
 				break
 			}
@@ -237,11 +237,11 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 	}
 
 	// Release all the readers except for the selected one.
-	for i, fr := range readers {
-		if fr == nil || i == idxSelected {
+	for i, r := range readers {
+		if r == nil || i == idxSelected {
 			continue
 		}
-		fr.Done <- fr
+		r.MessageDone <- r
 	}
 
 	if idxSelected == numClients {
@@ -254,9 +254,20 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 }
 
 type frameReader struct {
-	Receive <-chan *header
-	Result  chan<- struct{}
-	Done    chan<- *frameReader
+	// GetHeader synchronises access to `rw` between readers. A client is only
+	// allowed to read from `.rw`, after receiving a header via this channel.
+	// Once a header has been received, the frame body must be read by the
+	// client.  When reading is complete, a write to `.FrameDone` must be
+	// used to return control over `.rw` to the server.
+	GetHeader <-chan *header
+
+	// Once a client has finished reading the body of a frame, a send to
+	// `.FrameDone` must be used to return control over `.rw` to the server.
+	FrameDone chan<- struct{}
+
+	// MessageDone is used by clients to return the frameReader once a message
+	// has been read completely.
+	MessageDone chan<- *frameReader
 
 	rw *bufio.ReadWriter
 
@@ -281,15 +292,15 @@ func (r *frameReader) processHeader(header *header) {
 // On exit of this function, at least one of the following three
 // conditions is true:
 //
-//   - r.Remaining > 0
+//   - r.Remaining > 0 (returns true in this case only)
 //   - r.Final
 //   - r.connClosed
 //
 // The function returns true, if more data is available in the message.
-func (r *frameReader) prepareRead() bool {
+func (r *frameReader) hasAvailableData() bool {
 	for r.Remaining == 0 {
 		if !r.confirmed {
-			r.Result <- struct{}{}
+			r.FrameDone <- struct{}{}
 			r.confirmed = true
 		}
 
@@ -297,7 +308,7 @@ func (r *frameReader) prepareRead() bool {
 			break
 		}
 
-		header := <-r.Receive
+		header := <-r.GetHeader
 		if header == nil {
 			r.confirmed = true
 			r.connClosed = true
@@ -309,9 +320,9 @@ func (r *frameReader) prepareRead() bool {
 }
 
 // the function returns true, if reading the message is complete
-func (r *frameReader) finishRead() bool {
+func (r *frameReader) isDone() bool {
 	if r.Remaining == 0 && !r.confirmed {
-		r.Result <- struct{}{}
+		r.FrameDone <- struct{}{}
 		r.confirmed = true
 	}
 
@@ -321,25 +332,25 @@ func (r *frameReader) finishRead() bool {
 
 	// End of message reached, return a new frameReader to the channel
 	// and disable the current frameReader.
-	if r.Receive != nil {
+	if r.GetHeader != nil {
 		newR := &frameReader{
-			Receive: r.Receive,
-			Result:  r.Result,
-			Done:    r.Done,
-			rw:      r.rw,
+			GetHeader:   r.GetHeader,
+			FrameDone:   r.FrameDone,
+			MessageDone: r.MessageDone,
+			rw:          r.rw,
 		}
-		r.Done <- newR
+		r.MessageDone <- newR
 
-		r.Receive = nil
-		r.Result = nil
-		r.Done = nil
+		r.GetHeader = nil
+		r.FrameDone = nil
+		r.MessageDone = nil
 		r.rw = nil
 	}
 	return true
 }
 
 func (r *frameReader) Read(buf []byte) (n int, err error) {
-	if r.prepareRead() {
+	if r.hasAvailableData() {
 		// read data from the network
 		maxLen := r.Remaining
 		bufLen64 := uint64(len(buf))
@@ -356,7 +367,7 @@ func (r *frameReader) Read(buf []byte) (n int, err error) {
 		}
 		r.maskPos = (offs + n) % 4
 	}
-	if r.finishRead() && err == nil {
+	if r.isDone() && err == nil {
 		if r.Final {
 			err = io.EOF
 		} else if r.connClosed {
@@ -374,7 +385,7 @@ func (r *frameReader) Discard() (uint64, error) {
 	var blockSize uint64 = 1024 * 1024 * 1024 // 1GB
 
 	for {
-		if r.prepareRead() {
+		if r.hasAvailableData() {
 			r64 := r.Remaining
 			if r64 > blockSize {
 				r64 = blockSize
@@ -387,7 +398,7 @@ func (r *frameReader) Discard() (uint64, error) {
 				return total, err
 			}
 		}
-		if r.finishRead() {
+		if r.isDone() {
 			break
 		}
 	}
@@ -468,26 +479,27 @@ func (conn *Conn) readFrameBody(header *header) ([]byte, error) {
 
 // readMultiplexer multiplexes all data reads from the network.
 // Control frames are handled internally by this function.
-func (conn *Conn) readMultiplexer(ready chan<- struct{}) {
+func (conn *Conn) readMultiplexer(isFunctional chan<- struct{}) {
 	readerDone := make(chan struct{})
 	conn.readerDone = readerDone
-	drChan := make(chan *frameReader, 1)
-	conn.getDataReader = drChan
+	frChan := make(chan *frameReader, 1)
+	conn.getFrameReader = frChan
 
-	close(ready)
+	close(isFunctional)
 
-	dfChan := make(chan *header, 1)
-	resChan := make(chan struct{}, 1)
+	headerChan := make(chan *header, 1)
+	frameDone := make(chan struct{}, 1)
 	r := &frameReader{
-		Receive: dfChan,
-		Result:  resChan,
-		Done:    drChan,
-		rw:      conn.rw,
+		GetHeader:   headerChan,
+		FrameDone:   frameDone,
+		MessageDone: frChan,
+		rw:          conn.rw,
 	}
-	drChan <- r
+	frChan <- r
 
-	status := StatusInternalServerError
-	closeMessage := ""
+	// data for the close frame we will send to the client at the end
+	sendStatus := StatusInternalServerError
+
 	needsCont := false
 	var headerBuf [8]byte
 readLoop:
@@ -495,7 +507,7 @@ readLoop:
 		header, err := conn.readFrameHeader(headerBuf[:])
 		if err != nil {
 			if err == errFrameFormat {
-				status = StatusProtocolError
+				sendStatus = StatusProtocolError
 			}
 			break readLoop
 		}
@@ -503,41 +515,41 @@ readLoop:
 		switch header.Opcode {
 		case Text, Binary, contFrame:
 			if (header.Opcode == contFrame) != needsCont {
-				status = StatusProtocolError
+				sendStatus = StatusProtocolError
 				break readLoop
 			}
 			needsCont = !header.Final
 
-			dfChan <- header
-			<-resChan
+			headerChan <- header
+			<-frameDone // wait for the client to read the body of the frame
 		case closeFrame:
-			buf, _ := conn.readFrameBody(header)
 			// Since we are exiting anyway, we don't need to check for
-			// read errors here.
-			var s2 Status
+			// read errors here:
+			buf, _ := conn.readFrameBody(header)
+
+			sendStatus = StatusOK
+			recvStatus := StatusNotSent
+			var recvMessage string
 			if len(buf) >= 2 {
-				status = 256*Status(buf[0]) + Status(buf[1])
-				if status.isValid() && status != StatusNotSent && utf8.Valid(buf[2:]) {
-					closeMessage = string(buf[2:])
+				recvStatus = 256*Status(buf[0]) + Status(buf[1])
+				if recvStatus.isValid() && recvStatus != StatusNotSent && utf8.Valid(buf[2:]) {
+					sendStatus = recvStatus
+					recvMessage = string(buf[2:])
 				} else {
-					status = StatusProtocolError
-					s2 = StatusNotSent
+					sendStatus = StatusProtocolError
 				}
-			} else {
-				status = StatusNotSent
-			}
-			if s2 == 0 {
-				s2 = status
+			} else if len(buf) == 1 {
+				recvStatus = StatusDropped
+				sendStatus = StatusProtocolError
 			}
 			conn.closeMutex.Lock()
-			conn.clientStatus = s2
-			conn.clientMessage = closeMessage
+			conn.clientStatus = recvStatus
+			conn.clientMessage = recvMessage
 			conn.closeMutex.Unlock()
 			break readLoop
 		case pingFrame:
 			buf, err := conn.readFrameBody(header)
 			if err != nil {
-				closeMessage = "read failed"
 				break readLoop
 			}
 			ctl := framePool.Get().(*frame)
@@ -549,25 +561,23 @@ readLoop:
 			// we don't send ping frames, so we just swallow pong frames
 			_, err := conn.readFrameBody(header)
 			if err != nil {
-				closeMessage = "read failed"
 				break readLoop
 			}
 		default:
-			status = StatusProtocolError
-			closeMessage = "invalid opcode"
+			sendStatus = StatusProtocolError
 			break readLoop
 		}
 	}
 
 	// disable further receives
-	close(dfChan)
+	close(headerChan)
 
 	// Sending a close response unconditionally is safe,
 	// since the server will ignore everything after it has
 	// sent a close message once.
 	//
 	// Since we are exiting anyway, we don't care about errors here.
-	_ = conn.sendCloseFrame(status, []byte(closeMessage))
+	_ = conn.sendCloseFrame(sendStatus, nil)
 
 	close(readerDone)
 }

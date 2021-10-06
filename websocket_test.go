@@ -18,7 +18,6 @@ package websocket
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -425,17 +424,17 @@ func TestClientStatusCode(t *testing.T) {
 	defer server.Close()
 
 	type testCase struct {
-		s1 Status
-		m1 string
-		s2 Status
-		m2 string
+		c2sCode  Status
+		m1       string
+		expected Status
+		m2       string
 	}
 	cases := []*testCase{
-		{StatusOK, "good bye", StatusOK, "good bye"},
-		{4444, "good bye", 4444, "good bye"},
+		{StatusOK, "good bye", StatusOK, ""},
+		{4444, "good bye", 4444, ""},
 		{StatusNotSent, "", StatusNotSent, ""},
 		{9999, "", StatusNotSent, ""},
-		{0, "", StatusDropped, ""},
+		{StatusDropped, "", StatusDropped, ""},
 	}
 
 	for _, test := range cases {
@@ -444,28 +443,27 @@ func TestClientStatusCode(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if test.s1 > 0 {
+		if test.c2sCode != StatusDropped {
+			// send a close frame with status=test.c2sCode
 			var body []byte
-			if test.s1 != 1005 {
-				body = append(body, byte(test.s1>>8), byte(test.s1))
+			if test.c2sCode != 1005 {
+				body = append(body, byte(test.c2sCode>>8), byte(test.c2sCode))
 				body = append(body, []byte(test.m1)...)
 			}
-			err = client.SendFrame(8, body)
+			err = client.SendFrame(closeFrame, body)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			opcode, resp, err := client.ReadFrame()
-			if opcode != 8 || err != nil {
+			if opcode != closeFrame || err != nil {
 				t.Fatal(err)
 			}
-			if test.s1 == 9999 {
+
+			if test.c2sCode == 9999 {
 				// pass
-			} else if test.s1 != 1005 {
-				if !bytes.Equal(body, resp) {
-					t.Error("wrong status code/message sent by server")
-				}
-			} else if len(body) > 0 {
-				t.Error("server invented a body")
+			} else if len(resp) > 2 {
+				t.Error("server invented a body: " + string(body))
 			}
 		}
 		err = client.Close()
@@ -473,8 +471,9 @@ func TestClientStatusCode(t *testing.T) {
 			t.Fatal(err)
 		}
 		serverRes := <-c
-		if serverRes.status != test.s2 || serverRes.message != test.m2 {
-			t.Error("wrong status code/message recorded by server")
+		if serverRes.status != test.c2sCode || serverRes.message != test.m1 {
+			t.Errorf("wrong status code/message: %d/%s vs %d/%s",
+				serverRes.status, serverRes.message, test.c2sCode, test.m1)
 		}
 	}
 }
@@ -512,7 +511,7 @@ func TestServerStatusCode(t *testing.T) {
 		t.Error("client received wrong status code/message")
 	}
 
-	err = client.SendFrame(8, resp)
+	err = client.SendFrame(closeFrame, resp)
 	if err != nil {
 		t.Fatal(err)
 	}
