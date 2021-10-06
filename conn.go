@@ -70,8 +70,6 @@ const (
 	closeFrame MessageType = 8
 	pingFrame  MessageType = 9
 	pongFrame  MessageType = 10
-
-	invalidFrame MessageType = 255 // internal use only
 )
 
 func (tp MessageType) String() string {

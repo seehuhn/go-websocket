@@ -80,7 +80,20 @@ func (conn *Conn) receiveLimited(want MessageType, buf []byte) (n int, err error
 // must always be completely drained.
 func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 	r := <-conn.getDataReader
-	return r.doReceive()
+	if r == nil {
+		return 0, nil, ErrConnClosed
+	}
+
+	header := <-r.Receive
+	if header == nil {
+		r.confirmed = true
+		r.connClosed = true
+		r.Done <- r
+		return 0, nil, ErrConnClosed
+	}
+
+	r.processHeader(header)
+	return header.Opcode, r, nil
 }
 
 // ReceiveOneBinary listens on all connections until a new message arrives,
@@ -111,6 +124,34 @@ func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (int, s
 	return idx, string(buf[:n]), err
 }
 
+func receiveOneLimited(ctx context.Context, want MessageType, buf []byte, clients []*Conn) (idx, n int, err error) {
+	idx, tp, r, err := ReceiveOneMessage(ctx, clients)
+	if err != nil {
+		return idx, 0, err
+	}
+
+	if tp == want {
+		n, err = io.ReadFull(r, buf)
+	} else {
+		// we need to discard the message before bailing out
+		err = ErrMessageType
+	}
+
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if n > 0 {
+			err = nil
+		}
+	} else {
+		n2, e2 := r.(*frameReader).Discard()
+		if err == nil && n2 > 0 {
+			err = ErrTooLarge
+		} else if err == nil {
+			err = e2
+		}
+	}
+	return idx, n, err
+}
+
 // ReceiveOneMessage listens on all connections until a new message arrives.
 // The function returns the index of the connection, the message type, and a
 // reader which can be used to read the message contents.
@@ -127,7 +168,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 
 	// Set up channels to wait on in the select statement.
 	// Initially we wait only for readers and for the context to be cancelled.
-	// One we have readers, we will switch to listening for messages instead.
+	// Once we have readers, we switch to listening for messages instead.
 	cases := make([]reflect.SelectCase, numClients, numClients+1)
 	readers := make([]*frameReader, numClients)
 	for i, conn := range clients {
@@ -148,7 +189,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 
 	// Listen until we receive the first message on a reader, or until
 	// the context is cancelled.
-	idxSelected := -1
+	var idxSelected int
 	var idxError error
 	var opcode MessageType
 	for {
@@ -180,14 +221,17 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 		} else {
 			// We received data on a reader.
 
-			fr := readers[idx]
+			r := readers[idx]
 			header := recv.Interface().(*header)
-			opcode = fr.processHeader(header)
-			if opcode == invalidFrame {
-				fr.Done <- fr
+			if header == nil {
+				r.confirmed = true
+				r.connClosed = true
+				r.Done <- r
 				idxError = ErrConnClosed
 				break
 			}
+			r.processHeader(header)
+			opcode = header.Opcode
 			break
 		}
 	}
@@ -209,34 +253,6 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 	return idxSelected, opcode, readers[idxSelected], nil
 }
 
-func receiveOneLimited(ctx context.Context, want MessageType, buf []byte, clients []*Conn) (idx, n int, err error) {
-	idx, tp, r, err := ReceiveOneMessage(ctx, clients)
-	if err != nil {
-		return idx, 0, err
-	}
-
-	if tp == want {
-		n, err = io.ReadFull(r, buf)
-	} else {
-		// we need to discard the message before bailing out
-		err = ErrMessageType
-	}
-
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		if n > 0 {
-			err = nil
-		}
-	} else {
-		n2, e2 := r.(*frameReader).Discard()
-		if err == nil && n2 > 0 {
-			err = ErrTooLarge
-		} else if err == nil {
-			err = e2
-		}
-	}
-	return idx, n, err
-}
-
 type frameReader struct {
 	Receive <-chan *header
 	Result  chan<- struct{}
@@ -244,7 +260,7 @@ type frameReader struct {
 
 	rw *bufio.ReadWriter
 
-	// the following fields are all initialised by getNextHeader()
+	// the following fields are all initialised by processHeader()
 	Remaining  uint64
 	Mask       [4]byte
 	maskPos    int
@@ -253,33 +269,13 @@ type frameReader struct {
 	connClosed bool
 }
 
-func (r *frameReader) doReceive() (MessageType, io.Reader, error) {
-	if r == nil {
-		return 0, nil, ErrConnClosed
-	}
-
-	header := <-r.Receive
-	opcode := r.processHeader(header)
-	if opcode == invalidFrame {
-		r.Done <- r
-		return 0, nil, ErrConnClosed
-	}
-	return opcode, r, nil
-}
-
-func (r *frameReader) processHeader(header *header) MessageType {
-	if header == nil {
-		r.confirmed = true
-		r.connClosed = true
-		return invalidFrame
-	}
+func (r *frameReader) processHeader(header *header) {
 	r.confirmed = false
 	r.Remaining = header.Length
 	r.Final = header.Final
 	r.Mask = header.Mask
 	r.maskPos = 0
 	r.connClosed = false
-	return header.Opcode
 }
 
 // On exit of this function, at least one of the following three
@@ -302,7 +298,12 @@ func (r *frameReader) prepareRead() bool {
 		}
 
 		header := <-r.Receive
-		r.processHeader(header)
+		if header == nil {
+			r.confirmed = true
+			r.connClosed = true
+		} else {
+			r.processHeader(header)
+		}
 	}
 	return r.Remaining > 0
 }
@@ -441,18 +442,17 @@ func (conn *Conn) readFrameHeader(buf []byte) (*header, error) {
 		return nil, errFrameFormat
 	}
 
-	// read the masking key
-	_, err = io.ReadFull(conn.rw, buf[:4])
-	if err != nil {
-		return nil, err
-	}
-
 	h := &header{
 		Final:  final != 0,
 		Opcode: MessageType(opcode),
 		Length: length,
 	}
-	copy(h.Mask[:], buf[:4])
+
+	// read the masking key
+	_, err = io.ReadFull(conn.rw, h.Mask[:])
+	if err != nil {
+		return nil, err
+	}
 
 	return h, nil
 }
@@ -489,7 +489,7 @@ func (conn *Conn) readMultiplexer(ready chan<- struct{}) {
 	status := StatusInternalServerError
 	closeMessage := ""
 	needsCont := false
-	var headerBuf [10]byte
+	var headerBuf [8]byte
 readLoop:
 	for {
 		header, err := conn.readFrameHeader(headerBuf[:])

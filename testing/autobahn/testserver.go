@@ -14,9 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//go:build ignore
-// +build ignore
-
 package main
 
 import (
@@ -90,7 +87,7 @@ func runDocker(scratch string, done chan<- struct{}) {
 		"--net", "host",
 		"crossbario/autobahn-testsuite",
 
-		"/usr/local/bin/wstest",
+		"/opt/pypy/bin/wstest",
 		"-m", "fuzzingclient",
 		"-s", "/scratch/spec.json",
 	}
@@ -106,7 +103,7 @@ func runDocker(scratch string, done chan<- struct{}) {
 	state, err := process.Wait()
 	log.Println("========================================")
 	if err != nil {
-		log.Printf("DOCKER FAILED: status=%d, error=%s\n", state, err.Error())
+		log.Printf("DOCKER FAILED: status=%s, error=%s\n", state, err.Error())
 	} else {
 		log.Println("docker terminated")
 	}
