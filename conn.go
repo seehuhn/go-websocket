@@ -48,7 +48,7 @@ type Conn struct {
 	writerDone <-chan struct{}
 
 	getFrameReader   <-chan *frameReader
-	getDataWriter    <-chan *frameWriter
+	getFrameWriter   <-chan *frameWriter
 	sendControlFrame chan<- *frame
 
 	closeMutex    sync.Mutex
@@ -275,18 +275,16 @@ func (conn *Conn) GetStatus() (Status, string) {
 	return status, conn.clientMessage
 }
 
-// Close terminates a websocket connection and frees all associated
-// resources.  The connection cannot be used any more after Close()
-// has been called.
+// Close terminates a websocket connection and frees all associated resources.
+// The connection cannot be used any more after Close() has been called.
 //
-// The status code indicates whether the connection completed
-// successfully, or due to an error.  Use StatusOK for normal
-// termination, and one of the other status codes in case of errors.
-// Use StatusNotSent to not send a status code.
+// The status code indicates whether the connection completed successfully, or
+// due to an error.  Use StatusOK for normal termination, and one of the other
+// status codes in case of errors. Use StatusNotSent to not send a status code.
 //
-// The message can be used to provide additional information for
-// debugging.  The utf-8 representation of the string can be at most
-// 123 bytes long, otherwise ErrTooLarge is returned.
+// The message can be used to provide additional information to the client for
+// debugging.  The utf-8 representation of the string can be at most 123 bytes
+// long, otherwise ErrTooLarge is returned.
 func (conn *Conn) Close(code Status, message string) error {
 	if !code.isValid() || code == 1010 {
 		return ErrStatusCode
@@ -315,8 +313,8 @@ func (conn *Conn) Close(code Status, message string) error {
 	}
 
 	// The reader uses conn.sendControlFrame, so we must be sure the
-	// reader has stopped before we can stop the writer (by closing
-	// the channel).
+	// reader has stopped before we can stop the writer by closing
+	// the channel.
 	<-conn.readerDone
 
 	conn.closeMutex.Lock()

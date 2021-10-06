@@ -35,9 +35,12 @@ chat.LAST_NAMES = [
   'sloth'
 ];
 
+chat.proto = (location.protocol == 'https:' ? 'wss:' : 'ws:');
+chat.URL = chat.proto + '//' + location.host + '/api/chat';
+
+chat.ws = null;
+
 chat.connect = function() {
-  var proto = (location.protocol == 'https:' ? 'wss:' : 'ws:')
-  chat.URL = proto + '//' + location.host + '/api/chat';
   chat.ws = new WebSocket(chat.URL);
 
   var first = chat.FIRST_NAMES[Math.floor(Math.random() * chat.FIRST_NAMES.length)];
@@ -46,6 +49,7 @@ chat.connect = function() {
 
   chat.ws.addEventListener('open', function(event) {
     chat.ws.send('CHAT ' + name);
+    document.title = name;
   });
 
   var messagesDiv = document.getElementById('messages');
@@ -60,7 +64,7 @@ chat.connect = function() {
     }
 
     var s1 = document.createElement('SPAN');
-    d = new Date(msg.When);
+    var d = new Date(msg.When);
     s1.innerText = d.toLocaleTimeString();
     s1.className = 'time';
     p.appendChild(s1);
@@ -83,7 +87,7 @@ chat.connect = function() {
   var sendBox = document.getElementById('sendbox');
   // Execute a function when the user releases a key on the keyboard
   sendBox.addEventListener('keydown', function(event) {
-    if (event.keyCode === 13) {
+    if (event.key === 'Enter') {
       event.preventDefault();
       var text = sendBox.value;
       if (text == '') {

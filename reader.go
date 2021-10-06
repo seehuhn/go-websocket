@@ -183,8 +183,6 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 			Dir:  reflect.SelectRecv,
 			Chan: reflect.ValueOf(done),
 		})
-	} else {
-		cases = cases[:numClients]
 	}
 
 	// Listen until we receive the first message on a reader, or until
@@ -210,10 +208,6 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 			// We received a new reader.
 
 			fr := recv.Interface().(*frameReader)
-			if fr == nil { // TODO(voss): can this happen?
-				idxError = ErrConnClosed
-				break
-			}
 
 			// Switch to listening for the first packet on this reader.
 			readers[idx] = fr
@@ -481,10 +475,10 @@ func (conn *Conn) readFrameBody(header *header) ([]byte, error) {
 // Control frames are handled internally by this function.
 func (conn *Conn) readMultiplexer(isFunctional chan<- struct{}) {
 	readerDone := make(chan struct{})
-	conn.readerDone = readerDone
 	frChan := make(chan *frameReader, 1)
-	conn.getFrameReader = frChan
 
+	conn.readerDone = readerDone
+	conn.getFrameReader = frChan
 	close(isFunctional)
 
 	headerChan := make(chan *header, 1)
