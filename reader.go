@@ -56,8 +56,10 @@ func (conn *Conn) receiveLimited(want MessageType, buf []byte) (n int, err error
 		err = ErrMessageType
 	}
 
-	if n > 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
-		err = nil
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if n > 0 {
+			err = nil
+		}
 	} else {
 		n2, e2 := r.(*frameReader).Discard()
 		if err == nil && n2 > 0 {
@@ -66,7 +68,6 @@ func (conn *Conn) receiveLimited(want MessageType, buf []byte) (n int, err error
 			err = e2
 		}
 	}
-
 	return n, err
 }
 
@@ -123,30 +124,96 @@ func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (int, s
 // context.DeadlineExceeded.
 func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, io.Reader, error) {
 	numClients := len(clients)
-	cases := make([]reflect.SelectCase, numClients+1)
+
+	// Set up channels to wait on in the select statement.
+	// Initially we wait only for readers and for the context to be cancelled.
+	// One we have readers, we will switch to listening for messages instead.
+	cases := make([]reflect.SelectCase, numClients, numClients+1)
+	readers := make([]*frameReader, numClients)
 	for i, conn := range clients {
 		cases[i] = reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
 			Chan: reflect.ValueOf(conn.getDataReader),
 		}
 	}
-	cases[numClients] = reflect.SelectCase{
-		Dir:  reflect.SelectRecv,
-		Chan: reflect.ValueOf(ctx.Done()),
+	done := ctx.Done()
+	if done != nil {
+		cases = append(cases, reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(done),
+		})
+	} else {
+		cases = cases[:numClients]
 	}
 
-	idx, frValue, _ := reflect.Select(cases)
-	if idx == numClients {
+	// Listen until we receive the first message on a reader, or until
+	// the context is cancelled.
+	idxSelected := -1
+	var idxError error
+	var opcode MessageType
+	for {
+		idx, recv, recvOK := reflect.Select(cases)
+		idxSelected = idx
+
+		if idx == numClients {
+			// the context was cancelled
+			break
+		}
+
+		if !recvOK {
+			idxError = ErrConnClosed
+			break
+		}
+
+		if readers[idx] == nil {
+			// We received a new reader.
+
+			fr := recv.Interface().(*frameReader)
+			if fr == nil { // TODO(voss): can this happen?
+				idxError = ErrConnClosed
+				break
+			}
+
+			// Switch to listening for the first packet on this reader.
+			readers[idx] = fr
+			cases[idx].Chan = reflect.ValueOf(fr.Receive)
+		} else {
+			// We received data on a reader.
+
+			fr := readers[idx]
+			header := recv.Interface().(*header)
+			opcode = fr.processHeader(header)
+			if opcode == invalidFrame {
+				fr.Done <- fr
+				idxError = ErrConnClosed
+				break
+			}
+			break
+		}
+	}
+
+	// Release all the readers except for the selected one.
+	for i, fr := range readers {
+		if fr == nil || i == idxSelected {
+			continue
+		}
+		fr.Done <- fr
+	}
+
+	if idxSelected == numClients {
 		return -1, 0, nil, ctx.Err()
 	}
-
-	fr := frValue.Interface().(*frameReader)
-	tp, r, err := fr.doReceive()
-	return idx, tp, r, err
+	if idxError != nil {
+		return idxSelected, 0, nil, idxError
+	}
+	return idxSelected, opcode, readers[idxSelected], nil
 }
 
 func receiveOneLimited(ctx context.Context, want MessageType, buf []byte, clients []*Conn) (idx, n int, err error) {
 	idx, tp, r, err := ReceiveOneMessage(ctx, clients)
+	if err != nil {
+		return idx, 0, err
+	}
 
 	if tp == want {
 		n, err = io.ReadFull(r, buf)
@@ -155,8 +222,10 @@ func receiveOneLimited(ctx context.Context, want MessageType, buf []byte, client
 		err = ErrMessageType
 	}
 
-	if n > 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
-		err = nil
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if n > 0 {
+			err = nil
+		}
 	} else {
 		n2, e2 := r.(*frameReader).Discard()
 		if err == nil && n2 > 0 {
@@ -189,7 +258,8 @@ func (r *frameReader) doReceive() (MessageType, io.Reader, error) {
 		return 0, nil, ErrConnClosed
 	}
 
-	opcode := r.getNextHeader()
+	header := <-r.Receive
+	opcode := r.processHeader(header)
 	if opcode == invalidFrame {
 		r.Done <- r
 		return 0, nil, ErrConnClosed
@@ -197,8 +267,7 @@ func (r *frameReader) doReceive() (MessageType, io.Reader, error) {
 	return opcode, r, nil
 }
 
-func (r *frameReader) getNextHeader() MessageType {
-	header := <-r.Receive
+func (r *frameReader) processHeader(header *header) MessageType {
 	if header == nil {
 		r.confirmed = true
 		r.connClosed = true
@@ -232,7 +301,8 @@ func (r *frameReader) prepareRead() bool {
 			break
 		}
 
-		r.getNextHeader()
+		header := <-r.Receive
+		r.processHeader(header)
 	}
 	return r.Remaining > 0
 }

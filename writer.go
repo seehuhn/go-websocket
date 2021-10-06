@@ -17,9 +17,7 @@
 package websocket
 
 import (
-	"context"
 	"io"
-	"reflect"
 )
 
 const maxHeaderSize = 10
@@ -54,91 +52,6 @@ func (conn *Conn) sendData(opcode MessageType, data []byte) error {
 	err := <-w.Result
 	w.Done <- w
 	return err
-}
-
-// BroadcastError is used to return multiple errors from BroadcastText
-// and BroadcastBinary.  Each BroadcastError contains a connection and
-// the corresponding error.  Connections where no error occured are not
-// included in the result.  A BroadcastError where the Client field is nil
-// indicates that the request Context expired or was cancelled.
-type BroadcastError struct {
-	Client *Conn
-	Error  error
-}
-
-// BroadcastText sends the same text message to several connections.
-func BroadcastText(ctx context.Context, msg string, clients []*Conn) []BroadcastError {
-	return broadcastData(ctx, Text, []byte(msg), clients)
-}
-
-// BroadcastBinary sends the same binary message to several connections.
-func BroadcastBinary(ctx context.Context, msg []byte, clients []*Conn) []BroadcastError {
-	return broadcastData(ctx, Binary, msg, clients)
-}
-
-func broadcastData(ctx context.Context, opcode MessageType, data []byte, clients []*Conn) []BroadcastError {
-	// If performance becomes a concern, the method described
-	// here may be a solution:
-	// https://cyolo.io/blog/how-we-enabled-dynamic-channel-selection-at-scale-in-go/
-
-	numClients := len(clients)
-	cases := make([]reflect.SelectCase, numClients+1)
-	for i, conn := range clients {
-		cases[i] = reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(conn.getDataWriter),
-		}
-	}
-	cases[numClients] = reflect.SelectCase{
-		Dir:  reflect.SelectRecv,
-		Chan: reflect.ValueOf(ctx.Done()),
-	}
-
-	var errors []BroadcastError
-	todo := len(clients)
-	for todo > 0 {
-		i, recv, recvOK := reflect.Select(cases)
-
-		if i == numClients { // the context was cancelled
-			errors = append(errors, BroadcastError{
-				Error: ctx.Err(),
-			})
-			break
-		}
-
-		// mark client i as done
-		cases[i].Chan = reflect.ValueOf((<-chan *frameWriter)(nil))
-		todo--
-
-		if !recvOK {
-			errors = append(errors, BroadcastError{
-				Client: clients[i],
-				Error:  ErrConnClosed,
-			})
-			continue
-		}
-
-		msg := framePool.Get().(*frame)
-		msg.Opcode = opcode
-		msg.Body = data
-		msg.Final = true
-
-		w := recv.Interface().(*frameWriter)
-		// If performance becomes a concern, this could be changed to also use
-		// reflect.Select().
-		w.Send <- msg
-		err := <-w.Result
-		w.Done <- w
-
-		if err != nil {
-			errors = append(errors, BroadcastError{
-				Client: clients[i],
-				Error:  err,
-			})
-		}
-	}
-
-	return errors
 }
 
 // SendMessage starts a new message and returns an io.WriteCloser

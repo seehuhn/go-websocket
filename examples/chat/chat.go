@@ -46,11 +46,12 @@ func NewChat() *Chat {
 	}
 	chat.change = sync.NewCond(&chat.Mutex)
 
+	go chat.receiveMessages()
 	go chat.broadcastMessages(c)
 	return chat
 }
 
-func (chat *Chat) receiveMessages(ctl <-chan struct{}) {
+func (chat *Chat) receiveMessages() {
 	c := make(chan *members, 1)
 	currentMembers := make(chan *members, 1)
 
@@ -61,8 +62,6 @@ func (chat *Chat) receiveMessages(ctl <-chan struct{}) {
 			next := chat.members.Copy()
 			c <- next
 		}
-		chat.Unlock()
-		close(c)
 	}()
 
 	currentMembers <- <-c
@@ -215,6 +214,7 @@ func (chat *Chat) Remove(conn *websocket.Conn) {
 		}
 		chat.members.conns = chat.members.conns[:n]
 		chat.members.names = chat.members.names[:n]
+		chat.change.Broadcast()
 	}
 	chat.Unlock()
 }
