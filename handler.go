@@ -17,7 +17,11 @@
 package websocket
 
 import (
+	"crypto/sha1"
+	"encoding/base64"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 // Handler implements the http.Handler interface.  The handler
@@ -40,6 +44,9 @@ type Handler struct {
 	// access the service, and false otherwise.
 	AccessOk func(conn *Conn, protocols []string) bool
 
+	OriginAllowed func(origin *url.URL) bool
+	AccessAllowed func(r *http.Request) (bool, interface{})
+
 	// Handle is called after the websocket handshake has completed
 	// successfully, and the object conn can be used to send and
 	// receive messages on the connection.
@@ -53,6 +60,12 @@ type Handler struct {
 	// If non-empty, this string is sent in the "Server" HTTP header
 	// during handshake.
 	ServerName string
+
+	// The websocket subprotocols that the server implements, in decreasing
+	// order of preference.  The server selects the first possible value from
+	// this list, or null (no Sec-WebSocket-Protocol header sent) if none of
+	// the client-requested subprotocols are supported.
+	Subprotocols []string
 }
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
@@ -65,12 +78,11 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	conn := &Conn{}
-	status, msg := conn.handshake(w, req, handler)
+	conn, status := handler.handshake(w, req)
 	if status == http.StatusSwitchingProtocols {
 		w.WriteHeader(status)
 	} else {
-		http.Error(w, msg, status)
+		http.Error(w, "websocket handshake failed", status)
 		return
 	}
 	raw, rw, err := hijacker.Hijack()
@@ -96,4 +108,117 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// start the user handler
 	handler.Handle(conn)
+}
+
+func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Conn, int) {
+	version := req.Header.Get("Sec-Websocket-Version")
+	if version != "13" {
+		return nil, http.StatusUpgradeRequired
+	}
+	if strings.ToLower(req.Header.Get("Upgrade")) != "websocket" {
+		return nil, http.StatusBadRequest
+	}
+	connection := strings.ToLower(req.Header.Get("Connection"))
+	if !strings.Contains(connection, "upgrade") {
+		return nil, http.StatusBadRequest
+	}
+	key := req.Header.Get("Sec-Websocket-Key")
+	if key == "" {
+		return nil, http.StatusBadRequest
+	}
+
+	// protect against CSRF attacks
+	var originURI *url.URL
+	origin := req.Header.Get("Origin")
+	if origin != "" {
+		var err error
+		originURI, err = url.ParseRequestURI(origin)
+		if err != nil {
+			return nil, http.StatusBadRequest
+		}
+	}
+	var originAllowed bool
+	if handler.OriginAllowed != nil {
+		originAllowed = handler.OriginAllowed(originURI)
+	} else {
+		originAllowed = originURI == nil || originURI.Host == req.Host
+	}
+	if !originAllowed {
+		return nil, http.StatusForbidden
+	}
+
+	conn := &Conn{
+		RemoteAddr: req.RemoteAddr,
+	}
+
+	if handler.AccessAllowed != nil {
+		ok, data := handler.AccessAllowed(req)
+		if !ok {
+			return nil, http.StatusForbidden
+		}
+		conn.RequestData = data
+	}
+
+	origURI, err := url.ParseRequestURI(req.RequestURI)
+	if err == nil {
+		path := origURI.Path
+		if path == "" {
+			path = "/"
+		}
+		query := origURI.RawQuery
+		if query != "" {
+			query = "&" + query
+		}
+		conn.ResourceName = path + query
+	}
+
+	var clientProtos []string
+	protocol := strings.Join(req.Header["Sec-Websocket-Protocol"], ",")
+	if protocol != "" {
+		pp := strings.Split(protocol, ",")
+		for i := 0; i < len(pp); i++ {
+			p := strings.TrimSpace(pp[i])
+			if p != "" {
+				clientProtos = append(clientProtos, p)
+			}
+		}
+	}
+	if len(clientProtos) > 0 {
+		protoMap := make(map[string]bool)
+		for _, p := range clientProtos {
+			protoMap[p] = true
+		}
+		for _, p := range handler.Subprotocols {
+			if protoMap[p] {
+				conn.Protocol = p
+				break
+			}
+		}
+	}
+
+	if handler.AccessAllowed == nil && handler.AccessOk != nil {
+		// handle old style clients
+		ok := handler.AccessOk(conn, clientProtos)
+		if !ok {
+			return nil, http.StatusForbidden
+		}
+	}
+
+	h := sha1.New()
+	h.Write([]byte(key))
+	h.Write([]byte(websocketGUID))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	headers := w.Header()
+	headers.Set("Sec-WebSocket-Version", "13")
+	if conn.Protocol != "" {
+		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
+	}
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Connection", "Upgrade")
+	headers.Set("Sec-WebSocket-Accept", accept)
+	if handler.ServerName != "" {
+		headers.Set("Server", handler.ServerName)
+	}
+	return conn, http.StatusSwitchingProtocols
 }

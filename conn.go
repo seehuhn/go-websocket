@@ -18,13 +18,9 @@ package websocket
 
 import (
 	"bufio"
-	"crypto/sha1"
-	"encoding/base64"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 )
@@ -36,10 +32,11 @@ import (
 //
 // Use a Handler to obtain Conn objects.
 type Conn struct {
-	ResourceName *url.URL
+	ResourceName string
 	Origin       *url.URL
 	RemoteAddr   string
 	Protocol     string
+	RequestData  interface{} // as returned by Handler.AccessAllowed()
 
 	raw net.Conn
 	rw  *bufio.ReadWriter
@@ -148,87 +145,6 @@ var framePool = sync.Pool{
 	New: func() interface{} {
 		return new(frame)
 	},
-}
-
-func (conn *Conn) handshake(w http.ResponseWriter, req *http.Request,
-	handler *Handler) (status int, message string) {
-
-	headers := w.Header()
-
-	version := req.Header.Get("Sec-Websocket-Version")
-	if version != "13" {
-		headers.Set("Sec-WebSocket-Version", "13")
-		return http.StatusUpgradeRequired, "unknown version"
-	}
-	if strings.ToLower(req.Header.Get("Upgrade")) != "websocket" {
-		return http.StatusBadRequest, "missing upgrade header"
-	}
-	connection := strings.ToLower(req.Header.Get("Connection"))
-	if !strings.Contains(connection, "upgrade") {
-		return http.StatusBadRequest, "missing connection header"
-	}
-	key := req.Header.Get("Sec-Websocket-Key")
-	if key == "" {
-		return http.StatusBadRequest, "missing Sec-Websocket-Key"
-	}
-
-	var scheme string
-	if req.TLS != nil {
-		scheme = "wss"
-	} else {
-		scheme = "ws"
-	}
-	resourceName, err := url.ParseRequestURI(scheme + "://" + req.Host + req.URL.RequestURI())
-	if err != nil {
-		return http.StatusBadRequest, "invalid Request-URI"
-	}
-	conn.ResourceName = resourceName
-
-	var origin *url.URL
-	originString := req.Header.Get("Origin")
-	if originString != "" {
-		origin, err = url.ParseRequestURI(originString)
-		if err != nil {
-			return http.StatusBadRequest, "invalid Origin"
-		}
-	}
-	conn.Origin = origin
-	conn.RemoteAddr = req.RemoteAddr
-
-	var protocols []string
-	protocol := strings.Join(req.Header["Sec-Websocket-Protocol"], ",")
-	if protocol != "" {
-		pp := strings.Split(protocol, ",")
-		for i := 0; i < len(pp); i++ {
-			p := strings.TrimSpace(pp[i])
-			if p != "" {
-				protocols = append(protocols, p)
-			}
-		}
-	}
-
-	if handler.AccessOk != nil {
-		ok := handler.AccessOk(conn, protocols)
-		if !ok {
-			return http.StatusForbidden, "not allowed"
-		}
-	}
-
-	h := sha1.New()
-	h.Write([]byte(key))
-	h.Write([]byte(websocketGUID))
-	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-	if conn.Protocol != "" {
-		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
-	}
-	headers.Set("Upgrade", "websocket")
-	headers.Set("Connection", "Upgrade")
-	headers.Set("Sec-WebSocket-Accept", accept)
-	if handler.ServerName != "" {
-		headers.Set("Server", handler.ServerName)
-	}
-	return http.StatusSwitchingProtocols, ""
 }
 
 func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
