@@ -16,29 +16,27 @@
 
 package websocket
 
-type webSocketError string
+import "errors"
 
-func (err webSocketError) Error() string {
-	return string(err)
-}
-
-const (
+var (
 	// ErrConnClosed indicates that the websocket connection has been
 	// closed (either by the server or the client).
-	ErrConnClosed = webSocketError("connection closed")
+	ErrConnClosed = errors.New("connection closed")
 
 	// ErrMessageType indicates that an invalid message type has been
 	// encountered.  Valid message types are Text and Binary.
-	ErrMessageType = webSocketError("invalid message type")
+	ErrMessageType = errors.New("invalid message type")
 
 	// ErrStatusCode indicates that an invalid status code has been
 	// supplied.  Valid status codes are in the range from 1000 to
 	// 4999.
-	ErrStatusCode = webSocketError("invalid status code")
+	ErrStatusCode = errors.New("invalid status code")
 
 	// ErrTooLarge is used by ReceiveBinary and ReceiveText to
 	// indicate that the client sent a too large message.
-	ErrTooLarge = webSocketError("message too large")
+	ErrTooLarge = errors.New("message too large")
 
-	errFrameFormat = webSocketError("invalid frame format")
+	errFrameFormat = errors.New("invalid frame format")
+
+	errHandshake = errors.New("websocket handshake failed")
 )

@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -29,9 +30,9 @@ import (
 	"testing"
 )
 
-const (
-	errTestUpgradeFailed = webSocketError("protocol upgrade failed")
-	errTestWrongResult   = webSocketError("wrong result")
+var (
+	errTestUpgradeFailed = errors.New("protocol upgrade failed")
+	errTestWrongResult   = errors.New("wrong result")
 )
 
 type TestServer struct {

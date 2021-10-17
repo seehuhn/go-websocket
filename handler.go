@@ -19,6 +19,7 @@ package websocket
 import (
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -71,11 +72,20 @@ type Handler struct {
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
 
 func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	conn, _ := handler.Upgrade(w, req)
+
+	// start the user handler
+	handler.Handle(conn)
+}
+
+// Upgrade upgrades an HTTP connection to the websocket protocol.
+// After this function returns, `w` and `req` cannot be used any more
+// (even in the case of an error).
+func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn, error) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "hijacking not supported",
-			http.StatusInternalServerError)
-		return
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return nil, errors.New("connection hijacking not supported")
 	}
 
 	conn, status := handler.handshake(w, req)
@@ -83,18 +93,15 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(status)
 	} else {
 		http.Error(w, "websocket handshake failed", status)
-		return
+		return nil, errHandshake
 	}
 	raw, rw, err := hijacker.Hijack()
 	if err != nil {
-		http.Error(w, "hijacking failed", http.StatusInternalServerError)
-		return
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return nil, err
 	}
 	conn.raw = raw
 	conn.rw = rw
-
-	// TODO(voss): should the rest of this function be moved into a goroutine
-	// and the ServeHTTP method allowed to finish early?
 
 	// start the write multiplexer
 	writerReady := make(chan struct{})
@@ -106,11 +113,13 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	go conn.readMultiplexer(readerReady)
 	<-readerReady
 
-	// start the user handler
-	handler.Handle(conn)
+	return conn, nil
 }
 
 func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Conn, int) {
+	if req.Method != "GET" {
+		return nil, http.StatusBadRequest
+	}
 	version := req.Header.Get("Sec-Websocket-Version")
 	if version != "13" {
 		return nil, http.StatusUpgradeRequired
