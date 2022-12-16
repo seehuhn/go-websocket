@@ -526,7 +526,7 @@ readLoop:
 			var recvMessage string
 			if len(buf) >= 2 {
 				recvStatus = 256*Status(buf[0]) + Status(buf[1])
-				if recvStatus.isValid() && recvStatus != StatusNotSent && utf8.Valid(buf[2:]) {
+				if recvStatus.clientCanSend() && utf8.Valid(buf[2:]) {
 					sendStatus = recvStatus
 					recvMessage = string(buf[2:])
 				} else {

@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
@@ -691,7 +690,7 @@ func echo(conn *Conn) {
 			fmt.Println("cannot create writer:", err)
 			// We need to read the complete message, so that the next
 			// read doesn't block.
-			_, err = io.CopyBuffer(ioutil.Discard, r, buf)
+			_, err = io.CopyBuffer(io.Discard, r, buf)
 			if err != nil {
 				fmt.Println("discard error:", err)
 			}
@@ -701,7 +700,7 @@ func echo(conn *Conn) {
 		_, err = io.CopyBuffer(w, r, buf)
 		if err != nil {
 			fmt.Println("write error:", err)
-			_, err = io.CopyBuffer(ioutil.Discard, r, buf)
+			_, err = io.CopyBuffer(io.Discard, r, buf)
 			if err != nil {
 				fmt.Println("discard error:", err)
 			}

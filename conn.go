@@ -25,12 +25,12 @@ import (
 	"time"
 )
 
-// Conn represents a websocket connection initiated by a client.  All
-// fields are read-only.  It is ok to access a Conn from different
-// goroutines concurrently.  The connection must be closed using the
-// Close() method after use, to free all allocated resources.
+// Conn represents a websocket connection initiated by a client.  All fields
+// are read-only.  Use a Handler to obtain Conn objects.
 //
-// Use a Handler to obtain Conn objects.
+// It is ok to access a Conn from different goroutines concurrently.  The
+// connection must be closed using the Close() method after use, to free all
+// allocated resources.
 type Conn struct {
 	ResourceName string
 	Origin       *url.URL
@@ -96,19 +96,27 @@ type Status uint16
 // Conn.Close() method.
 // See: https://tools.ietf.org/html/rfc6455#section-7.4.1
 const (
-	StatusOK                  Status = 1000
-	StatusGoingAway           Status = 1001
-	StatusProtocolError       Status = 1002
-	StatusUnsupportedType     Status = 1003
-	StatusNotSent             Status = 1005
-	StatusDropped             Status = 1006
-	StatusInvalidData         Status = 1007
-	StatusPolicyViolation     Status = 1008
-	StatusTooLarge            Status = 1009
-	StatusInternalServerError Status = 1011
+	StatusOK                     Status = 1000
+	StatusGoingAway              Status = 1001
+	StatusProtocolError          Status = 1002
+	StatusUnsupportedType        Status = 1003
+	StatusNotSent                Status = 1005 // never sent over the wire
+	StatusDropped                Status = 1006 // never sent over the wire
+	StatusInvalidData            Status = 1007
+	StatusPolicyViolation        Status = 1008
+	StatusTooLarge               Status = 1009
+	StatusClientMissingExtension Status = 1010 // only sent by client
+	StatusInternalServerError    Status = 1011
 )
 
-func (code Status) isValid() bool {
+func (code Status) clientCanSend() bool {
+	if code >= 3000 && code < 5000 || code == StatusClientMissingExtension {
+		return true
+	}
+	return knownValidCode[code]
+}
+
+func (code Status) serverCanSend() bool {
 	if code >= 3000 && code < 5000 {
 		return true
 	}
@@ -116,57 +124,17 @@ func (code Status) isValid() bool {
 }
 
 var knownValidCode = map[Status]bool{
-	StatusOK:                  true,
-	StatusGoingAway:           true,
-	StatusProtocolError:       true,
-	StatusUnsupportedType:     true,
-	StatusNotSent:             true,
-	StatusInvalidData:         true,
-	StatusPolicyViolation:     true,
-	StatusTooLarge:            true,
-	1010:                      true, // never sent by server
+	StatusOK:              true,
+	StatusGoingAway:       true,
+	StatusProtocolError:   true,
+	StatusUnsupportedType: true,
+	// StatusNotSent is never sent over the wire
+	// StatusDropped is never sent over the wire
+	StatusInvalidData:     true,
+	StatusPolicyViolation: true,
+	StatusTooLarge:        true,
+	// StatusClientMissingExtension is only sent by the client
 	StatusInternalServerError: true,
-}
-
-type header struct {
-	Length uint64
-	Mask   [4]byte
-	Final  bool
-	Opcode MessageType
-}
-
-type frame struct {
-	Body   []byte
-	Final  bool
-	Opcode MessageType
-}
-
-var framePool = sync.Pool{
-	New: func() interface{} {
-		return new(frame)
-	},
-}
-
-func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
-	var buf []byte
-	if status != 0 && status != StatusNotSent {
-		buf = make([]byte, 2+len(body))
-		buf[0] = byte(status >> 8)
-		buf[1] = byte(status)
-		copy(buf[2:], body)
-	}
-	ctl := framePool.Get().(*frame)
-	ctl.Opcode = closeFrame
-	ctl.Body = buf
-	ctl.Final = true
-
-	conn.closeMutex.Lock()
-	defer conn.closeMutex.Unlock()
-	if conn.isClosed {
-		return ErrConnClosed
-	}
-	conn.sendControlFrame <- ctl
-	return nil
 }
 
 // GetStatus returns the status and message the client sent when
@@ -202,7 +170,7 @@ func (conn *Conn) GetStatus() (Status, string) {
 // debugging.  The utf-8 representation of the string can be at most 123 bytes
 // long, otherwise ErrTooLarge is returned.
 func (conn *Conn) Close(code Status, message string) error {
-	if !code.isValid() || code == 1010 {
+	if !(code.serverCanSend() || code == StatusNotSent) {
 		return ErrStatusCode
 	}
 
@@ -216,6 +184,8 @@ func (conn *Conn) Close(code Status, message string) error {
 		return err
 	}
 
+	// Give the client 3 seconds to close the connection, before closing it
+	// from our end.
 	needsClose := true
 	timeOut := time.NewTimer(3 * time.Second)
 	select {
@@ -224,7 +194,7 @@ func (conn *Conn) Close(code Status, message string) error {
 			<-timeOut.C
 		}
 	case <-timeOut.C:
-		conn.raw.Close()
+		conn.raw.Close() // force-stop the reader
 		needsClose = false
 	}
 
@@ -246,4 +216,45 @@ func (conn *Conn) Close(code Status, message string) error {
 	}
 
 	return nil
+}
+
+func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
+	var buf []byte
+	if status != StatusNotSent {
+		buf = make([]byte, 2+len(body))
+		buf[0] = byte(status >> 8)
+		buf[1] = byte(status)
+		copy(buf[2:], body)
+	}
+	ctl := framePool.Get().(*frame)
+	ctl.Opcode = closeFrame
+	ctl.Body = buf
+	ctl.Final = true
+
+	conn.closeMutex.Lock()
+	defer conn.closeMutex.Unlock()
+	if conn.isClosed {
+		return ErrConnClosed
+	}
+	conn.sendControlFrame <- ctl
+	return nil
+}
+
+type header struct {
+	Length uint64
+	Mask   [4]byte
+	Final  bool
+	Opcode MessageType
+}
+
+type frame struct {
+	Body   []byte
+	Final  bool
+	Opcode MessageType
+}
+
+var framePool = sync.Pool{
+	New: func() interface{} {
+		return new(frame)
+	},
 }

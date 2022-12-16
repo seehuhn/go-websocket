@@ -28,24 +28,20 @@ import (
 // Handler implements the http.Handler interface.  The handler
 // responds to requests by opening a websocket connection.
 type Handler struct {
-	// AccessOK, if non-nil, is called during the opening handshake to
-	// decide whether the client is allowed to access the service.  At
-	// the time this function is called, the connection is not yet
-	// functional, but the fields ResourceName (describing the URL the
-	// client used to access the server) and Origin (as reported by
-	// the web browser) are already initialised.
+	// OriginAllowed can be set to a function which returns true
+	// if access should be allowed for the given value of the Origin http
+	// header.
 	//
-	// If the client sends a list of supported sub-protocols, these
-	// will be available in protocols.  In this case, AccessOk must
-	// assign one of the supported sub-protocols to the Protocol field
-	// of conn.  Otherwise the connection setup will fail.
-	// See: https://tools.ietf.org/html/rfc6455#section-1.9
-	//
-	// The function must return true, if the client is allowed to
-	// access the service, and false otherwise.
-	AccessOk func(conn *Conn, protocols []string) bool
-
+	// If OriginAllowed is not set, a same-origin policy is used.
 	OriginAllowed func(origin *url.URL) bool
+
+	// AccessAllowed can be set to a function which determines whether
+	// the given request is allowed to establish a WebSocket connection
+	// (true indicates that the request should go ahead, false indicates
+	// that the request should be blocked).
+	// In addition, the function can return information from the request
+	// (e.g. login details extracted from cookies).  The returned value is
+	// then stored in the Conn.RequestData field.
 	AccessAllowed func(r *http.Request) (bool, interface{})
 
 	// Handle is called after the websocket handshake has completed
@@ -62,11 +58,16 @@ type Handler struct {
 	// during handshake.
 	ServerName string
 
-	// The websocket subprotocols that the server implements, in decreasing
+	// The websocket sub-protocols that the server implements, in decreasing
 	// order of preference.  The server selects the first possible value from
 	// this list, or null (no Sec-WebSocket-Protocol header sent) if none of
 	// the client-requested subprotocols are supported.
 	Subprotocols []string
+
+	// AccessOK should not be used in new code.
+	//
+	// Deprecated: Use OriginAllowed and/or AccessAllowed instead.
+	AccessOk func(conn *Conn, protocols []string) bool
 }
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
@@ -182,8 +183,7 @@ func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Co
 	}
 
 	var clientProtos []string
-	protocol := strings.Join(req.Header["Sec-Websocket-Protocol"], ",")
-	if protocol != "" {
+	for _, protocol := range req.Header["Sec-Websocket-Protocol"] {
 		pp := strings.Split(protocol, ",")
 		for i := 0; i < len(pp); i++ {
 			p := strings.TrimSpace(pp[i])
@@ -206,7 +206,7 @@ func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Co
 	}
 
 	if handler.AccessAllowed == nil && handler.AccessOk != nil {
-		// handle old style clients
+		// handle legacy clients
 		ok := handler.AccessOk(conn, clientProtos)
 		if !ok {
 			return nil, http.StatusForbidden
