@@ -45,7 +45,7 @@ type Handler struct {
 	AccessAllowed func(r *http.Request) (bool, interface{})
 
 	// Handle is called after the websocket handshake has completed
-	// successfully, and the object conn can be used to send and
+	// successfully and the object conn can be used to send and
 	// receive messages on the connection.
 	//
 	// The connection object conn can be passed to other parts of the
@@ -73,7 +73,10 @@ type Handler struct {
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
 
 func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	conn, _ := handler.Upgrade(w, req)
+	conn, err := handler.Upgrade(w, req)
+	if err != nil {
+		return
+	}
 
 	// start the user handler
 	handler.Handle(conn)
@@ -90,12 +93,12 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 	}
 
 	conn, status := handler.handshake(w, req)
-	if status == http.StatusSwitchingProtocols {
-		w.WriteHeader(status)
-	} else {
+	if status != http.StatusSwitchingProtocols {
 		http.Error(w, "websocket handshake failed", status)
 		return nil, errHandshake
 	}
+
+	w.WriteHeader(status)
 	raw, rw, err := hijacker.Hijack()
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -118,11 +121,16 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 }
 
 func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Conn, int) {
-	if req.Method != "GET" {
+	if req.Method != "GET" || req.ProtoMajor == 1 && req.ProtoMinor == 0 {
 		return nil, http.StatusBadRequest
 	}
+
 	version := req.Header.Get("Sec-Websocket-Version")
 	if version != "13" {
+		headers := w.Header()
+		headers.Set("Upgrade", "websocket")
+		headers.Set("Connection", "Upgrade")
+		headers.Set("Sec-WebSocket-Version", "13")
 		return nil, http.StatusUpgradeRequired
 	}
 	if strings.ToLower(req.Header.Get("Upgrade")) != "websocket" {
@@ -219,15 +227,123 @@ func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Co
 	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
 	headers := w.Header()
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Connection", "Upgrade")
 	headers.Set("Sec-WebSocket-Version", "13")
 	if conn.Protocol != "" {
 		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
 	}
-	headers.Set("Upgrade", "websocket")
-	headers.Set("Connection", "Upgrade")
 	headers.Set("Sec-WebSocket-Accept", accept)
 	if handler.ServerName != "" {
 		headers.Set("Server", handler.ServerName)
 	}
 	return conn, http.StatusSwitchingProtocols
+}
+
+// containsToken reports whether s contains token as a token.
+// The comparison is case-insensitive.
+// token must be lower case.
+func containsToken(s, token string) bool {
+	pos := 0
+	n := len(s)
+
+	// skip to the first token
+	for pos < n && !isTokenByte[s[pos]] {
+		pos++
+	}
+
+	for pos < n {
+		start := pos
+		for pos < n && isTokenByte[s[pos]] {
+			pos++
+		}
+		if strings.ToLower(s[start:pos]) == token {
+			return true
+		}
+
+		for pos < n && !isTokenByte[s[pos]] {
+			pos++
+		}
+	}
+	return false
+}
+
+var isTokenByte = map[byte]bool{
+	'!':  true,
+	'#':  true,
+	'$':  true,
+	'%':  true,
+	'&':  true,
+	'\'': true,
+	'*':  true,
+	'+':  true,
+	'-':  true,
+	'.':  true,
+	'0':  true,
+	'1':  true,
+	'2':  true,
+	'3':  true,
+	'4':  true,
+	'5':  true,
+	'6':  true,
+	'7':  true,
+	'8':  true,
+	'9':  true,
+	'A':  true,
+	'B':  true,
+	'C':  true,
+	'D':  true,
+	'E':  true,
+	'F':  true,
+	'G':  true,
+	'H':  true,
+	'I':  true,
+	'J':  true,
+	'K':  true,
+	'L':  true,
+	'M':  true,
+	'N':  true,
+	'O':  true,
+	'P':  true,
+	'Q':  true,
+	'R':  true,
+	'S':  true,
+	'T':  true,
+	'U':  true,
+	'V':  true,
+	'W':  true,
+	'X':  true,
+	'Y':  true,
+	'Z':  true,
+	'^':  true,
+	'_':  true,
+	'`':  true,
+	'a':  true,
+	'b':  true,
+	'c':  true,
+	'd':  true,
+	'e':  true,
+	'f':  true,
+	'g':  true,
+	'h':  true,
+	'i':  true,
+	'j':  true,
+	'k':  true,
+	'l':  true,
+	'm':  true,
+	'n':  true,
+	'o':  true,
+	'p':  true,
+	'q':  true,
+	'r':  true,
+	's':  true,
+	't':  true,
+	'u':  true,
+	'v':  true,
+	'w':  true,
+	'x':  true,
+	'y':  true,
+	'z':  true,
+	'|':  true,
+	'~':  true,
 }
