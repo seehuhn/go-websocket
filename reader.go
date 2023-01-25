@@ -491,7 +491,7 @@ func (conn *Conn) readMultiplexer(isFunctional chan<- struct{}) {
 	}
 	frChan <- r
 
-	// data for the close frame we will send to the client at the end
+	// data for the close frame which we will send to the client at the end
 	sendStatus := StatusInternalServerError
 
 	needsCont := false

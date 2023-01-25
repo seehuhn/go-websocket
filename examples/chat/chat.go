@@ -28,7 +28,7 @@ import (
 	"seehuhn.de/go/websocket"
 )
 
-// Chat represent one chat server.
+// Chat represents one chat server.
 type Chat struct {
 	send chan<- *Message
 
@@ -37,7 +37,7 @@ type Chat struct {
 	members *members
 }
 
-// NewChat creates a new Chat objects and starts the associated goroutines.
+// NewChat creates a new Chat object and starts the associated goroutines.
 func NewChat() *Chat {
 	c := make(chan *Message, 1)
 	chat := &Chat{
