@@ -17,7 +17,7 @@
 /*
 Package websocket implements an HTTP server to accept websocket connections.
 
-To accept websocket connections from clients, use a websocket.Handler
+To accept websocket connections from clients, use a [websocket.Handler]
 object:
 
 	websocketHandler := &websocket.Handler{
@@ -26,15 +26,14 @@ object:
 	http.Handle("/api/ws", websocketHandler)
 
 The function myHandler is called every time a client requests a new
-websocket.  The websocket.Conn object passed to handler can be used
+websocket.  The [websocket.Conn] object passed to handler can be used
 to send and receive messages.  The handler must close the connection
-when finished with it:
+when it is finished with it:
 
 	func myHandler(conn *websocket.Conn) {
 		defer conn.Close(websocket.StatusOK, "")
 
 		// use conn to send and receive messages.
 	}
-
 */
 package websocket
