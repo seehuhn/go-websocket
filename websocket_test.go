@@ -405,6 +405,8 @@ func TestClientStatusCode(t *testing.T) {
 		message string
 	}
 	c := make(chan *res, 1)
+
+	// server code
 	handler := func(conn *Conn) {
 		_, err := conn.ReceiveText(128)
 		if err == ErrConnClosed {
@@ -424,31 +426,35 @@ func TestClientStatusCode(t *testing.T) {
 	defer server.Close()
 
 	type testCase struct {
-		c2sCode  Status
-		m1       string
-		expected Status
-		m2       string
+		sentCode        Status // client -> server
+		sentMessage     string // client -> server
+		expectedCode    Status
+		expectedMessage string
 	}
 	cases := []*testCase{
-		{StatusOK, "good bye", StatusOK, ""},
-		{4444, "good bye", 4444, ""},
+		// good cases
+		{StatusOK, "good bye", StatusOK, "good bye"},
+		{4444, "good bye", 4444, "good bye"},
 		{StatusNotSent, "", StatusNotSent, ""},
-		{9999, "", StatusNotSent, ""},
 		{StatusDropped, "", StatusDropped, ""},
+
+		{9999, "", StatusDropped, ""},     // invalid status code
+		{9999, "test", StatusDropped, ""}, // invalid status code
 	}
 
-	for _, test := range cases {
+	for testNo, test := range cases {
+		// fake client code
 		client, err := server.Connect()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if test.c2sCode != StatusDropped {
-			// send a close frame with status=test.c2sCode
+		if test.sentCode != StatusDropped {
+			// send a close frame with status=test.sentCode
 			var body []byte
-			if test.c2sCode != 1005 {
-				body = append(body, byte(test.c2sCode>>8), byte(test.c2sCode))
-				body = append(body, []byte(test.m1)...)
+			if test.sentCode != StatusNotSent {
+				body = append(body, byte(test.sentCode>>8), byte(test.sentCode))
+				body = append(body, []byte(test.sentMessage)...)
 			}
 			err = client.SendFrame(closeFrame, body)
 			if err != nil {
@@ -460,7 +466,7 @@ func TestClientStatusCode(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if test.c2sCode == 9999 {
+			if test.sentCode == 9999 {
 				// pass
 			} else if len(resp) > 2 {
 				t.Error("server invented a body: " + string(body))
@@ -470,10 +476,11 @@ func TestClientStatusCode(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		serverRes := <-c
-		if serverRes.status != test.c2sCode || serverRes.message != test.m1 {
-			t.Errorf("wrong status code/message: %d/%s vs %d/%s",
-				serverRes.status, serverRes.message, test.c2sCode, test.m1)
+		recv := <-c
+		if recv.status != test.expectedCode || recv.message != test.expectedMessage {
+			t.Errorf("%d wrong status code/message: received %d/%s, expected %d/%s",
+				testNo,
+				recv.status, recv.message, test.expectedCode, test.expectedMessage)
 		}
 	}
 }
@@ -524,62 +531,6 @@ func TestServerStatusCode(t *testing.T) {
 	serverRes := <-c
 	if serverRes.status != StatusOK || serverRes.message != "penguin" {
 		t.Error("wrong status code/message recorded by server")
-	}
-}
-
-// TestDiscard tests that too long messages are correctly processed
-// on the server side.
-func TestDiscard(t *testing.T) {
-	var serverError string
-	server, err := StartTestServer(func(conn *Conn) {
-		// We send messages of 300 bytes length, but only use a buffer of 150
-		// bytes.  Make sure ErrTooLarge is reported.
-		msg := make([]byte, 150)
-		status := StatusOK
-		for {
-			n, err := conn.ReceiveBinaryOld(msg)
-			if err == ErrConnClosed {
-				return
-			} else if err != ErrTooLarge {
-				serverError = "errTooLarge not reported"
-				status = StatusProtocolError
-				break
-			}
-			err = conn.SendBinary(msg[:n])
-			if err != nil {
-				serverError = "server error: " + err.Error()
-				status = StatusProtocolError
-				break
-			}
-		}
-		conn.Close(status, "")
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-
-	client, err := server.Connect()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	buf := make([]byte, 100)
-	for i := 0; i < 10; i++ {
-		// Repeat the test, to make sure that the server drains the unread
-		// part of the message and does not hang.
-		err = client.BounceBinary(300, buf, binaryLengthCheck(150))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	err = client.Close()
-	if err != nil {
-		t.Error(err)
-	}
-	if serverError != "" {
-		t.Error(serverError)
 	}
 }
 
@@ -677,7 +628,7 @@ func echo(conn *Conn) {
 
 	buf := make([]byte, 16*1024)
 	for {
-		tp, r, err := conn.ReceiveMessageOld()
+		tp, r, err := conn.ReceiveMessage()
 		if err == ErrConnClosed {
 			break
 		} else if err != nil {

@@ -17,9 +17,9 @@
 package websocket
 
 import (
-	"bufio"
 	"context"
 	"io"
+	"math"
 	"reflect"
 	"unicode/utf8"
 )
@@ -29,10 +29,15 @@ type messageInfo struct {
 	sizeHint    int64 // -1 if unknown
 }
 
+type readResult struct {
+	n     int
+	final bool
+}
+
 type readMultiplexerData struct {
 	newMessage chan<- *messageInfo
 	fromUser   <-chan []byte
-	toUser     chan<- int
+	toUser     chan<- readResult
 
 	readerDone chan<- struct{}
 }
@@ -88,24 +93,36 @@ readLoop:
 			for !done {
 				buf := <-data.fromUser
 
-				amount := len(buf)
-				if amount > int(available) {
-					amount = int(available)
-				}
-				n, err := conn.rw.Read(buf[:amount])
-				if check(err) {
-					break readLoop
-				}
-				available -= int64(n)
+				if buf != nil {
+					amount := len(buf)
+					if amount > int(available) {
+						amount = int(available)
+					}
+					n, err := conn.rw.Read(buf[:amount])
+					if check(err) {
+						break readLoop
+					}
+					available -= int64(n)
 
-				done := header.Final && available == 0
-
-				if done {
-					// Send a negative amount to signal that the
-					// message is complete.
-					data.toUser <- -n
+					done = header.Final && available == 0
+					data.toUser <- readResult{n, done}
 				} else {
-					data.toUser <- n
+					n, err := io.CopyN(io.Discard, conn.rw, available)
+					if check(err) {
+						break readLoop
+					}
+					available -= n
+
+					if n > math.MaxInt {
+						// We only use n to detect whether any data was
+						// read at all, so we can safely truncate the value.
+						n = math.MaxInt
+					}
+					done = header.Final
+					data.toUser <- readResult{int(n), done}
+				}
+				if available == 0 {
+					break
 				}
 			}
 
@@ -178,9 +195,6 @@ readLoop:
 	// Finally, notify the user that no more data will be incoming.
 	close(data.newMessage)
 	close(data.toUser)
-	for range data.fromUser {
-		// drain the channel of user requests
-	}
 }
 
 // readFrameHeader reads and decodes a frame header
@@ -278,11 +292,11 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 }
 
 // ReceiveOneMessage listens on all given connections until a new message
-// arrives. The function returns the index of the connection, the message type,
+// arrives.  The function returns the index of the connection, the message type,
 // and a reader which can be used to read the message contents.
 //
 // No more messages can be received on this connection until the returned
-// io.Reader has been drained.  In order to avoid deadlocks, the reader must
+// io.Reader has been drained.  In order to avoid deadlocks, the caller must
 // always read the complete message.
 //
 // If the context expires or is cancelled, the error is either
@@ -290,6 +304,15 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 //
 // If more than 65535 clients are given, the function panics.
 func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, io.Reader, error) {
+	idx, msgInfo, err := selectChannel(ctx, clients)
+	if err != nil {
+		return -1, 0, nil, err
+	}
+	r := &frameReader{conn: clients[idx]}
+	return idx, msgInfo.messageType, r, nil
+}
+
+func selectChannel(ctx context.Context, clients []*Conn) (int, *messageInfo, error) {
 	numClients := len(clients)
 	if numClients > 65535 {
 		// select supports at most 65536 cases, and we need one for the context
@@ -315,22 +338,21 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 
 		if idx == numClients {
 			// the context was cancelled
-			return -1, 0, nil, ctx.Err()
+			return -1, nil, ctx.Err()
 		}
 
 		if !recvOK {
 			// the connection was closed
 			numClosed++
 			if numClosed == numClients {
-				return -1, 0, nil, ErrConnClosed
+				return -1, nil, ErrConnClosed
 			}
 			cases[idx].Chan = reflect.ValueOf((<-chan *messageInfo)(nil))
 			continue
 		}
 
 		msgInfo := recv.Interface().(*messageInfo)
-		r := &frameReader{conn: clients[idx]}
-		return idx, msgInfo.messageType, r, nil
+		return idx, msgInfo, nil
 	}
 }
 
@@ -344,26 +366,28 @@ func (r *frameReader) Read(buf []byte) (int, error) {
 		return 0, io.EOF
 	}
 	r.conn.fromUser <- buf
-	n := <-r.conn.toUser
-	if n < 0 {
-		r.isEOF = true
-		return -n, io.EOF
-	}
-	return n, nil
+	res := <-r.conn.toUser
+	r.isEOF = res.final
+	return res.n, nil
 }
 
-// ReceiveBinary reads a binary message from the connection.  If the next
-// received message is not binary, the channel is closed with status
-// StatusProtoclError and [ErrConnClosed] is returned.  If the received message
-// is longer than buf, the buffer contains the start of the message and
-// [ErrTooLarge] is returned.
+// ReceiveBinary reads a binary message from the connection.  If the message
+// received is not binary, the channel is closed with status StatusProtoclError
+// and [ErrConnClosed] is returned.
+//
+// If the received message is longer than buf, the buffer contains the start of
+// the message and [ErrTooLarge] is returned.
 func (conn *Conn) ReceiveBinary(buf []byte) (int, error) {
 	msgInfo, ok := <-conn.newMessage
 	if !ok {
 		return 0, ErrConnClosed
 	}
+	return conn.doReceiveBinary(buf, msgInfo)
+}
 
+func (conn *Conn) doReceiveBinary(buf []byte, msgInfo *messageInfo) (int, error) {
 	if msgInfo.messageType != Binary {
+		conn.drainMessage()
 		err := conn.Close(StatusProtocolError, "expected binary message")
 		if err == nil {
 			err = ErrConnClosed
@@ -375,305 +399,131 @@ func (conn *Conn) ReceiveBinary(buf []byte) (int, error) {
 	done := false
 	for pos < len(buf) && !done {
 		conn.fromUser <- buf[pos:]
-		n := <-conn.toUser
-		if n < 0 {
-			n = -n
-		}
-		pos += n
+		res := <-conn.toUser
+		pos += res.n
+		done = res.final
 	}
 
+	overflow := false
 	if !done {
-		for {
-			conn.fromUser <- nil
-			n := <-conn.toUser
-			if n < 0 {
-				return len(buf), ErrTooLarge
-			}
+		overflow = conn.drainMessage()
+	}
+
+	var err error
+	if overflow {
+		err = ErrTooLarge
+	}
+	return pos, err
+}
+
+func (conn *Conn) drainMessage() bool {
+	overflow := false
+	for {
+		conn.fromUser <- nil
+		res := <-conn.toUser
+		if res.n > 0 {
+			overflow = true
+		}
+		if res.final {
+			break
 		}
 	}
-
-	return pos, nil
+	return overflow
 }
 
-// =======================================================================
-
-// ReceiveBinaryOld reads a binary message from the connection.  If the
-// next received message is not binary, ErrMessageType is returned and
-// the received message is discarded.  If the received message is
-// longer than buf, buf contains the start of the message and
-// ErrTooLarge is returned.
-func (conn *Conn) ReceiveBinaryOld(buf []byte) (n int, err error) {
-	return conn.receiveLimited(Binary, buf)
-}
-
-// ReceiveText reads a text message from the connection.  If the next received
-// message is not a text message, ErrMessageType is returned and the received
-// message is discarded.  If the length of the utf-8 representation of the text
-// exceeds maxLength bytes, the text is truncated and ErrTooLarge is returned.
-func (conn *Conn) ReceiveText(maxLength int) (string, error) {
-	buf := make([]byte, maxLength)
-	n, err := conn.receiveLimited(Text, buf)
-	return string(buf[:n]), err
-}
-
-func (conn *Conn) receiveLimited(want MessageType, buf []byte) (n int, err error) {
-	tp, r, err := conn.ReceiveMessageOld()
-	if err != nil {
-		return 0, err
-	}
-
-	if tp == want {
-		n, err = io.ReadFull(r, buf)
-	} else {
-		// we need to discard the message before bailing out
-		err = ErrMessageType
-	}
-
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		if n > 0 {
-			err = nil
-		}
-	} else {
-		n2, e2 := r.(*frameReaderOLD).Discard()
-		if err == nil && n2 > 0 {
-			err = ErrTooLarge
-		} else if err == nil {
-			err = e2
-		}
-	}
-	return n, err
-}
-
-// ReceiveMessageOld returns an io.Reader which can be used to read the next
-// message from the connection.  The first return value gives the message type
-// received (Text or Binary).
+// ReceiveOneBinary listens on all given connections until a new message
+// arrives, and then reads this message.  If the message received is not
+// binary, the channel is closed with status StatusProtoclError and
+// [ErrConnClosed] is returned.
 //
-// No more messages can be received until the returned io.Reader has been
-// darined.  In order to avoid deadlocks, the reader must always read the
-// complete message.
-func (conn *Conn) ReceiveMessageOld() (MessageType, io.Reader, error) {
-	r := <-conn.getFrameReaderOLD
-	if r == nil {
-		return 0, nil, ErrConnClosed
-	}
-
-	header := <-r.GetHeader
-	if header == nil {
-		r.confirmed = true
-		r.connClosed = true
-		r.MessageDone <- r
-		return 0, nil, ErrConnClosed
-	}
-
-	r.processHeader(header)
-	return header.Opcode, r, nil
-}
-
-// ReceiveOneBinary listens on all connections until a new message arrives,
-// and returns this message.  If the next received message is not binary,
-// ErrMessageType is returned and the received message is discarded.  If the
-// received message is longer than buf, buf contains the start of the message
-// and ErrTooLarge is returned.
+// If the received message is longer than buf, the buffer contains the start of
+// the message and [ErrTooLarge] is returned.
 //
-// If the context expires or is cancelled, -1 is returned for the
-// connection index, and the error is either context.Cancelled or
-// context.DeadlineExceeded.
+// If the context expires or is cancelled, the error is either
+// context.DeadlineExceeded or context.Cancelled.
 func ReceiveOneBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int, err error) {
-	return receiveOneLimited(ctx, Binary, buf, clients)
-}
-
-// ReceiveOneText listens on all connections until a new message arrives, and
-// returns this message.  If the next received message is not a text message,
-// ErrMessageType is returned and the received message is discarded.  If the
-// length of the utf-8 representation of the text exceeds maxLength bytes, the
-// text is truncated and ErrTooLarge is returned.
-//
-// If the context expires or is cancelled, -1 is returned for the
-// connection index, and the error is either context.Cancelled or
-// context.DeadlineExceeded.
-func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (int, string, error) {
-	buf := make([]byte, maxLength)
-	idx, n, err := receiveOneLimited(ctx, Text, buf, clients)
-	return idx, string(buf[:n]), err
-}
-
-func receiveOneLimited(ctx context.Context, want MessageType, buf []byte, clients []*Conn) (idx, n int, err error) {
-	idx, tp, r, err := ReceiveOneMessage(ctx, clients)
+	idx, msgInfo, err := selectChannel(ctx, clients)
 	if err != nil {
-		return idx, 0, err
+		return -1, 0, err
 	}
-
-	if tp == want {
-		n, err = io.ReadFull(r, buf)
-	} else {
-		// we need to discard the message before bailing out
-		err = ErrMessageType
-	}
-
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		if n > 0 {
-			err = nil
-		}
-	} else {
-		n2, e2 := r.(*frameReaderOLD).Discard()
-		if err == nil && n2 > 0 {
-			err = ErrTooLarge
-		} else if err == nil {
-			err = e2
-		}
-	}
+	n, err = clients[idx].doReceiveBinary(buf, msgInfo)
 	return idx, n, err
 }
 
-type frameReaderOLD struct {
-	// GetHeader synchronises access to `rw` between readers. A client is only
-	// allowed to read from `.rw`, after receiving a header via this channel.
-	// Once a header has been received, the frame body must be read by the
-	// client.  When reading is complete, a write to `.FrameDone` must be
-	// used to return control over `.rw` to the server.
-	GetHeader <-chan *header
-
-	// Once a client has finished reading the body of a frame, a send to
-	// `.FrameDone` must be used to return control over `.rw` to the server.
-	FrameDone chan<- struct{}
-
-	// MessageDone is used by clients to return the frameReader once a message
-	// has been read completely.
-	MessageDone chan<- *frameReaderOLD
-
-	rw *bufio.ReadWriter
-
-	// the following fields are all initialised by processHeader()
-	Remaining  int64
-	Mask       [4]byte
-	maskPos    int
-	confirmed  bool
-	Final      bool
-	connClosed bool
+// ReceiveText reads a text message from the connection.  If the next received
+// message is not a text message, , the channel is closed with status
+// StatusProtoclError and [ErrConnClosed] is returned.  If the length of the
+// utf-8 representation of the text exceeds maxLength bytes, the text is
+// truncated and ErrTooLarge is returned.
+func (conn *Conn) ReceiveText(maxLength int) (string, error) {
+	msgInfo, ok := <-conn.newMessage
+	if !ok {
+		return "", ErrConnClosed
+	}
+	return conn.doReceiveText(maxLength, msgInfo)
 }
 
-func (r *frameReaderOLD) processHeader(header *header) {
-	r.confirmed = false
-	r.Remaining = header.Length
-	r.Final = header.Final
-	r.Mask = header.Mask
-	r.maskPos = 0
-	r.connClosed = false
-}
-
-// On exit of this function, at least one of the following three
-// conditions is true:
-//
-//   - r.Remaining > 0 (returns true in this case only)
-//   - r.Final
-//   - r.connClosed
-//
-// The function returns true, if more data is available in the message.
-func (r *frameReaderOLD) hasAvailableData() bool {
-	for r.Remaining == 0 {
-		if !r.confirmed {
-			r.FrameDone <- struct{}{}
-			r.confirmed = true
-		}
-
-		if r.Final || r.connClosed {
-			break
-		}
-
-		header := <-r.GetHeader
-		if header == nil {
-			r.confirmed = true
-			r.connClosed = true
-		} else {
-			r.processHeader(header)
-		}
-	}
-	return r.Remaining > 0
-}
-
-// the function returns true, if reading the message is complete
-func (r *frameReaderOLD) isDone() bool {
-	if r.Remaining == 0 && !r.confirmed {
-		r.FrameDone <- struct{}{}
-		r.confirmed = true
-	}
-
-	if r.Remaining > 0 || !(r.Final || r.connClosed) {
-		return false
-	}
-
-	// End of message reached, return a new frameReader to the channel
-	// and disable the current frameReader.
-	if r.GetHeader != nil {
-		newR := &frameReaderOLD{
-			GetHeader:   r.GetHeader,
-			FrameDone:   r.FrameDone,
-			MessageDone: r.MessageDone,
-			rw:          r.rw,
-		}
-		r.MessageDone <- newR
-
-		r.GetHeader = nil
-		r.FrameDone = nil
-		r.MessageDone = nil
-		r.rw = nil
-	}
-	return true
-}
-
-func (r *frameReaderOLD) Read(buf []byte) (n int, err error) {
-	if r.hasAvailableData() {
-		// read data from the network
-		maxLen := r.Remaining
-		bufLen64 := int64(len(buf))
-		if maxLen > bufLen64 {
-			maxLen = bufLen64
-		}
-
-		n, err = r.rw.Read(buf[:maxLen])
-		r.Remaining -= int64(n)
-
-		offs := r.maskPos
-		for i := 0; i < n; i++ {
-			buf[i] ^= r.Mask[(i+offs)%4]
-		}
-		r.maskPos = (offs + n) % 4
-	}
-	if r.isDone() && err == nil {
-		if r.Final {
-			err = io.EOF
-		} else if r.connClosed {
+func (conn *Conn) doReceiveText(maxLength int, msgInfo *messageInfo) (string, error) {
+	if msgInfo.messageType != Text {
+		conn.drainMessage()
+		err := conn.Close(StatusProtocolError, "expected text message")
+		if err == nil {
 			err = ErrConnClosed
 		}
+		return "", err
 	}
-	return
+
+	if msgInfo.sizeHint >= 0 && msgInfo.sizeHint < int64(maxLength) {
+		maxLength = int(msgInfo.sizeHint)
+	}
+	buf := make([]byte, maxLength)
+
+	pos := 0
+	done := false
+	for pos < len(buf) && !done {
+		conn.fromUser <- buf[pos:]
+		res := <-conn.toUser
+		pos += res.n
+		done = res.final
+	}
+
+	overflow := false
+	if !done {
+		overflow = conn.drainMessage()
+	}
+
+	// check for incomplete/invalid utf-8
+	idx := 0
+	for idx < pos {
+		r, size := utf8.DecodeRune(buf[idx:pos])
+		if r == utf8.RuneError {
+			if overflow && idx > pos-utf8.UTFMax && utf8.RuneStart(buf[idx]) {
+				// the last rune might be incomplete
+				pos = idx
+				break
+			}
+
+			err := conn.Close(StatusProtocolError, "invalid utf-8")
+			if err == nil {
+				err = ErrConnClosed
+			}
+			return "", err
+		}
+		idx += size
+	}
+
+	var err error
+	if overflow {
+		err = ErrTooLarge
+	}
+	return string(buf[:pos]), err
 }
 
-func (r *frameReaderOLD) Discard() (int64, error) {
-	var total int64
-
-	// Discard in blocks, in case the remaining length does not fit
-	// into an int.
-	var blockSize int64 = 1024 * 1024 * 1024 // 1GB
-
-	for {
-		if r.hasAvailableData() {
-			r64 := r.Remaining
-			if r64 > blockSize {
-				r64 = blockSize
-			}
-			n, err := r.rw.Discard(int(r64))
-			n64 := int64(n)
-			r.Remaining -= n64
-			total += n64
-			if err != nil {
-				return total, err
-			}
-		}
-		if r.isDone() {
-			break
-		}
+func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (idx int, text string, err error) {
+	idx, msgInfo, err := selectChannel(ctx, clients)
+	if err != nil {
+		return -1, "", err
 	}
-
-	return total, nil
+	text, err = clients[idx].doReceiveText(maxLength, msgInfo)
+	return idx, text, err
 }

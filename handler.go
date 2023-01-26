@@ -114,8 +114,11 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 
 	// start the read multiplexer
 	newMessage := make(chan *messageInfo)
-	fromUser := make(chan []byte)
-	toUser := make(chan int)
+	// FromUser must have capacity 1, so users who send a buffer don't hang, if
+	// the client terminates the connection (and thus the reader goroutine)
+	// during a call to [Conn.ReadMessage] etc.
+	fromUser := make(chan []byte, 1)
+	toUser := make(chan readResult)
 	readerDone := make(chan struct{})
 	conn.newMessage = newMessage
 	conn.fromUser = fromUser

@@ -43,7 +43,7 @@ type Conn struct {
 
 	newMessage <-chan *messageInfo
 	fromUser   chan<- []byte
-	toUser     <-chan int
+	toUser     <-chan readResult
 
 	// ReaderDone is closed when the reader goroutine has finished.
 	// After this point, the reader will not access the Conn object
@@ -52,9 +52,8 @@ type Conn struct {
 
 	writerDone <-chan struct{}
 
-	getFrameReaderOLD <-chan *frameReaderOLD
-	getFrameWriter    <-chan *frameWriter
-	sendControlFrame  chan<- *frame
+	getFrameWriter   <-chan *frameWriter
+	sendControlFrame chan<- *frame
 
 	closeMutex    sync.Mutex
 	isClosed      bool // no more messages can be sent
