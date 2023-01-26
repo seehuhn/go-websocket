@@ -41,12 +41,20 @@ type Conn struct {
 	raw net.Conn
 	rw  *bufio.ReadWriter
 
+	newMessage <-chan *messageInfo
+	fromUser   chan<- []byte
+	toUser     <-chan int
+
+	// ReaderDone is closed when the reader goroutine has finished.
+	// After this point, the reader will not access the Conn object
+	// any more and will not send any more control messages.
 	readerDone <-chan struct{}
+
 	writerDone <-chan struct{}
 
-	getFrameReader   <-chan *frameReader
-	getFrameWriter   <-chan *frameWriter
-	sendControlFrame chan<- *frame
+	getFrameReaderOLD <-chan *frameReaderOLD
+	getFrameWriter    <-chan *frameWriter
+	sendControlFrame  chan<- *frame
 
 	closeMutex    sync.Mutex
 	isClosed      bool // no more messages can be sent
@@ -200,7 +208,7 @@ func (conn *Conn) Close(code Status, message string) error {
 
 	// The reader uses conn.sendControlFrame, so we must be sure the
 	// reader has stopped before we can stop the writer by closing
-	// the channel.
+	// [conn.sendControlFrame].
 	<-conn.readerDone
 
 	conn.closeMutex.Lock()
@@ -241,7 +249,7 @@ func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
 }
 
 type header struct {
-	Length uint64
+	Length int64
 	Mask   [4]byte
 	Final  bool
 	Opcode MessageType

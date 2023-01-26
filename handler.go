@@ -113,9 +113,21 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 	<-writerReady
 
 	// start the read multiplexer
-	readerReady := make(chan struct{})
-	go conn.readMultiplexer(readerReady)
-	<-readerReady
+	newMessage := make(chan *messageInfo)
+	fromUser := make(chan []byte)
+	toUser := make(chan int)
+	readerDone := make(chan struct{})
+	conn.newMessage = newMessage
+	conn.fromUser = fromUser
+	conn.toUser = toUser
+	conn.readerDone = readerDone
+	data := &readMultiplexerData{
+		newMessage: newMessage,
+		fromUser:   fromUser,
+		toUser:     toUser,
+		readerDone: readerDone,
+	}
+	go conn.readMultiplexer(data)
 
 	return conn, nil
 }

@@ -537,7 +537,7 @@ func TestDiscard(t *testing.T) {
 		msg := make([]byte, 150)
 		status := StatusOK
 		for {
-			n, err := conn.ReceiveBinary(msg)
+			n, err := conn.ReceiveBinaryOld(msg)
 			if err == ErrConnClosed {
 				return
 			} else if err != ErrTooLarge {
@@ -677,7 +677,7 @@ func echo(conn *Conn) {
 
 	buf := make([]byte, 16*1024)
 	for {
-		tp, r, err := conn.ReceiveMessage()
+		tp, r, err := conn.ReceiveMessageOld()
 		if err == ErrConnClosed {
 			break
 		} else if err != nil {

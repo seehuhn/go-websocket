@@ -32,7 +32,7 @@ func echo(conn *websocket.Conn) {
 	defer conn.Close(websocket.StatusOK, "")
 
 	for {
-		tp, r, err := conn.ReceiveMessage()
+		tp, r, err := conn.ReceiveMessageOld()
 		if err == websocket.ErrConnClosed {
 			break
 		} else if err != nil {

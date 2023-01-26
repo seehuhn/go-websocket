@@ -73,7 +73,7 @@ func broadcastData(ctx context.Context, opcode MessageType, data []byte, clients
 	errors := make(map[int]error)
 
 	disabled := reflect.Zero(reflect.ChanOf(reflect.BothDir,
-		reflect.TypeOf(&frameReader{})))
+		reflect.TypeOf(&frameReaderOLD{})))
 
 	// each client goes through the following stages:
 	//   * w := <-conn.getFrameWriter (abort with error if nil)

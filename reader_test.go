@@ -25,32 +25,32 @@ func TestReadBinary(t *testing.T) {
 	handler := func(conn *Conn) {
 		buf := make([]byte, 2)
 
-		n, err := conn.ReceiveBinary(buf)
+		n, err := conn.ReceiveBinaryOld(buf)
 		if err != nil || n != 1 || buf[0] != 1 {
 			t.Fatalf("read 1 failed: buf=[%x], err=%s", buf[:n], err)
 		}
 
-		n, err = conn.ReceiveBinary(buf)
+		n, err = conn.ReceiveBinaryOld(buf)
 		if err != ErrMessageType || n != 0 {
 			t.Fatalf("read 2 failed: buf=[%x], err=%s", buf[:n], err)
 		}
 
-		n, err = conn.ReceiveBinary(buf)
+		n, err = conn.ReceiveBinaryOld(buf)
 		if err != nil || n != 1 || buf[0] != 3 {
 			t.Fatalf("read 3 failed: buf=[%x], err=%s", buf[:n], err)
 		}
 
-		n, err = conn.ReceiveBinary(buf)
+		n, err = conn.ReceiveBinaryOld(buf)
 		if err != ErrTooLarge || n != 2 || buf[0] != 4 {
 			t.Fatalf("read 4 failed: buf=[%x], err=%s", buf[:n], err)
 		}
 
-		n, err = conn.ReceiveBinary(buf)
+		n, err = conn.ReceiveBinaryOld(buf)
 		if err != nil || n != 1 || buf[0] != 5 {
 			t.Fatalf("read 5 failed: buf=[%x], err=%s", buf[:n], err)
 		}
 
-		n, err = conn.ReceiveBinary(buf)
+		n, err = conn.ReceiveBinaryOld(buf)
 		if err != ErrConnClosed || n != 0 {
 			t.Fatalf("not properly closed: buf=[%x], err=%s", buf[:n], err)
 		}
