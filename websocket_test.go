@@ -587,6 +587,28 @@ func TestKeepConn(t *testing.T) {
 	}
 }
 
+func TestEchoMany(t *testing.T) {
+	server, err := StartTestServer(echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	buf := make([]byte, 16)
+	for i := 0; i < 1e6; i++ {
+		err = client.BounceBinary(16, buf, binaryLengthCheck(16))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkEcho(b *testing.B) {
 	server, err := StartTestServer(echo)
 	if err != nil {

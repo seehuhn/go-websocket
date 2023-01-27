@@ -25,8 +25,8 @@ import (
 )
 
 type messageInfo struct {
+	sizeHint    int // -1 if unknown
 	messageType MessageType
-	sizeHint    int64 // -1 if unknown
 }
 
 type readResult struct {
@@ -35,7 +35,7 @@ type readResult struct {
 }
 
 type readMultiplexerData struct {
-	newMessage chan<- *messageInfo
+	newMessage chan<- messageInfo
 	fromUser   <-chan []byte
 	toUser     chan<- readResult
 
@@ -62,9 +62,10 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 
 	needsCont := false
 	scratch := make([]byte, 128) // buffer for headers and control frame payloads
+	header := &header{}
 readLoop:
 	for {
-		header, err := conn.readFrameHeader(scratch)
+		err := conn.readFrameHeader(header, scratch)
 		if check(err) {
 			break readLoop
 		}
@@ -78,11 +79,11 @@ readLoop:
 			needsCont = !header.Final
 
 			if header.Opcode != contFrame {
-				sizeHint := int64(-1)
-				if header.Final {
-					sizeHint = header.Length
+				sizeHint := -1
+				if header.Final && header.Length <= math.MaxInt {
+					sizeHint = int(header.Length)
 				}
-				data.newMessage <- &messageInfo{
+				data.newMessage <- messageInfo{
 					messageType: header.Opcode,
 					sizeHint:    sizeHint,
 				}
@@ -198,22 +199,22 @@ readLoop:
 }
 
 // readFrameHeader reads and decodes a frame header
-func (conn *Conn) readFrameHeader(scratch []byte) (*header, error) {
+func (conn *Conn) readFrameHeader(header *header, scratch []byte) error {
 	_, err := io.ReadFull(conn.rw, scratch[:2])
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	final := scratch[0] & 128
 	reserved := (scratch[0] >> 4) & 7
 	if reserved != 0 {
-		return nil, errFrameFormat
+		return errFrameFormat
 	}
 	opcode := scratch[0] & 15
 
 	mask := scratch[1] & 128
 	if mask == 0 {
-		return nil, errFrameFormat
+		return errFrameFormat
 	}
 
 	// read the length
@@ -227,7 +228,7 @@ func (conn *Conn) readFrameHeader(scratch []byte) (*header, error) {
 	if lengthBytes > 1 {
 		n, _ := io.ReadFull(conn.rw, scratch[:lengthBytes])
 		if n < lengthBytes {
-			return nil, errFrameFormat
+			return errFrameFormat
 		}
 	} else {
 		scratch[0] = l8
@@ -237,26 +238,24 @@ func (conn *Conn) readFrameHeader(scratch []byte) (*header, error) {
 		length = length<<8 | uint64(scratch[i])
 	}
 	if length&(1<<63) != 0 {
-		return nil, errFrameFormat
+		return errFrameFormat
 	}
 
 	if opcode >= 8 && (final == 0 || length > 125) {
-		return nil, errFrameFormat
+		return errFrameFormat
 	}
 
-	h := &header{
-		Final:  final != 0,
-		Opcode: MessageType(opcode),
-		Length: int64(length),
-	}
+	header.Final = final != 0
+	header.Opcode = MessageType(opcode)
+	header.Length = int64(length)
 
 	// read the masking key
-	_, err = io.ReadFull(conn.rw, h.Mask[:])
+	_, err = io.ReadFull(conn.rw, header.Mask[:])
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return h, nil
+	return nil
 }
 
 func (conn *Conn) readControlFrameBody(buf []byte, header *header) ([]byte, error) {
@@ -312,7 +311,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 	return idx, msgInfo.messageType, r, nil
 }
 
-func selectChannel(ctx context.Context, clients []*Conn) (int, *messageInfo, error) {
+func selectChannel(ctx context.Context, clients []*Conn) (int, messageInfo, error) {
 	numClients := len(clients)
 	if numClients > 65535 {
 		// select supports at most 65536 cases, and we need one for the context
@@ -338,20 +337,20 @@ func selectChannel(ctx context.Context, clients []*Conn) (int, *messageInfo, err
 
 		if idx == numClients {
 			// the context was cancelled
-			return -1, nil, ctx.Err()
+			return -1, messageInfo{}, ctx.Err()
 		}
 
 		if !recvOK {
 			// the connection was closed
 			numClosed++
 			if numClosed == numClients {
-				return -1, nil, ErrConnClosed
+				return -1, messageInfo{}, ErrConnClosed
 			}
-			cases[idx].Chan = reflect.ValueOf((<-chan *messageInfo)(nil))
+			cases[idx].Chan = reflect.ValueOf((<-chan messageInfo)(nil))
 			continue
 		}
 
-		msgInfo := recv.Interface().(*messageInfo)
+		msgInfo := recv.Interface().(messageInfo)
 		return idx, msgInfo, nil
 	}
 }
@@ -385,7 +384,7 @@ func (conn *Conn) ReceiveBinary(buf []byte) (int, error) {
 	return conn.doReceiveBinary(buf, msgInfo)
 }
 
-func (conn *Conn) doReceiveBinary(buf []byte, msgInfo *messageInfo) (int, error) {
+func (conn *Conn) doReceiveBinary(buf []byte, msgInfo messageInfo) (int, error) {
 	if msgInfo.messageType != Binary {
 		conn.drainMessage()
 		err := conn.Close(StatusProtocolError, "expected binary message")
@@ -463,7 +462,7 @@ func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 	return conn.doReceiveText(maxLength, msgInfo)
 }
 
-func (conn *Conn) doReceiveText(maxLength int, msgInfo *messageInfo) (string, error) {
+func (conn *Conn) doReceiveText(maxLength int, msgInfo messageInfo) (string, error) {
 	if msgInfo.messageType != Text {
 		conn.drainMessage()
 		err := conn.Close(StatusProtocolError, "expected text message")
@@ -473,8 +472,8 @@ func (conn *Conn) doReceiveText(maxLength int, msgInfo *messageInfo) (string, er
 		return "", err
 	}
 
-	if msgInfo.sizeHint >= 0 && msgInfo.sizeHint < int64(maxLength) {
-		maxLength = int(msgInfo.sizeHint)
+	if msgInfo.sizeHint >= 0 && msgInfo.sizeHint < maxLength {
+		maxLength = msgInfo.sizeHint
 	}
 	buf := make([]byte, maxLength)
 

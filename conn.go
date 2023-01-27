@@ -41,7 +41,7 @@ type Conn struct {
 	raw net.Conn
 	rw  *bufio.ReadWriter
 
-	newMessage <-chan *messageInfo
+	newMessage <-chan messageInfo
 	fromUser   chan<- []byte
 	toUser     <-chan readResult
 
