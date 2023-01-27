@@ -167,6 +167,11 @@ func TestReceiveWrongType(t *testing.T) {
 			errorsInServer <- fmt.Sprintf("wrong type: buf=[% x], err=%s", buf[:n], err)
 		}
 
+		err = conn.Close(StatusOK, "OK")
+		if err != nil {
+			errorsInServer <- err.Error()
+		}
+
 		close(errorsInServer)
 	}
 

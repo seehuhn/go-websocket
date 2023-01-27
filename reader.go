@@ -63,6 +63,10 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 		}
 	}
 
+	// Notify the user that no more data will be incoming.
+	close(data.toUser)
+
+	// Determine the client status code and message.
 	clientStatus := StatusDropped
 	var clientMessage string
 	if b.header.Opcode == closeFrame && !b.failed {
@@ -95,9 +99,6 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 	// Closing this will terminate the writer, so this must come after the call
 	// to [Conn.sendCloseFrame].
 	close(data.readerDone)
-
-	// Finally, notify the user that no more data will be incoming.
-	close(data.toUser)
 }
 
 func (b *readBompel) refill(isCont bool) error {
