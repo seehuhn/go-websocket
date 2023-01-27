@@ -41,14 +41,13 @@ type Conn struct {
 	raw net.Conn
 	rw  *bufio.ReadWriter
 
-	newMessage <-chan messageInfo
-	fromUser   chan<- []byte
-	toUser     <-chan readResult
-
 	// ReaderDone is closed when the reader goroutine has finished.
 	// After this point, the reader will not access the Conn object
 	// any more and will not send any more control messages.
 	readerDone <-chan struct{}
+
+	toUser   <-chan *readBompel
+	fromUser chan<- *readBompel
 
 	writerDone <-chan struct{}
 
