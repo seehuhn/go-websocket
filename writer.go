@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"reflect"
 	"time"
 )
 
@@ -217,6 +218,69 @@ func (conn *Conn) SendText(msg string) error {
 	return nil
 }
 
+func BroadcastBinary(ctx context.Context, clients []*Conn, msg []byte) map[int]error {
+	return doBroadcast(ctx, clients, Binary, msg)
+}
+
 func BroadcastText(ctx context.Context, clients []*Conn, msg string) map[int]error {
-	panic("not implemented")
+	return doBroadcast(ctx, clients, Text, []byte(msg))
+}
+
+func doBroadcast(ctx context.Context, clients []*Conn, tp MessageType, msg []byte) map[int]error {
+	numClients := len(clients)
+	if numClients > 65535 {
+		// select supports at most 65536 cases, and we need one for the context
+		panic("too many clients")
+	}
+
+	// set up channels for the select statement
+	cases := make([]reflect.SelectCase, numClients+1)
+	for i, conn := range clients {
+		cases[i] = reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(conn.writeBompelStore),
+		}
+	}
+	cases[numClients] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(ctx.Done()),
+	}
+
+	disabled := reflect.Zero(reflect.ChanOf(reflect.BothDir,
+		reflect.TypeOf(&writeBompel{})))
+	todo := numClients
+	errors := make(map[int]error)
+mainLoop:
+	for todo > 0 {
+		idx, recv, recvOK := reflect.Select(cases)
+
+		if idx == numClients {
+			// the context was cancelled
+			err := ctx.Err()
+			for i := 0; i < numClients; i++ {
+				if cases[i].Chan != disabled {
+					errors[i] = err
+				}
+			}
+			break mainLoop
+		}
+
+		cases[idx].Chan = disabled
+
+		if !recvOK {
+			// the connection was closed
+			errors[idx] = ErrConnClosed
+			todo--
+			continue mainLoop
+		}
+
+		wb := recv.Interface().(*writeBompel)
+		err := wb.sendFrame(tp, msg, true)
+		if err != nil {
+			errors[idx] = err
+			continue mainLoop
+		}
+		clients[idx].writeBompelStore <- wb
+	}
+	return errors
 }

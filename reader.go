@@ -529,7 +529,7 @@ func selectChannel(ctx context.Context, clients []*Conn) (int, *readBompel, erro
 			continue
 		}
 
-		b := recv.Interface().(*readBompel)
-		return idx, b, nil
+		rb := recv.Interface().(*readBompel)
+		return idx, rb, nil
 	}
 }
