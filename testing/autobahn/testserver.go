@@ -21,7 +21,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -128,19 +127,21 @@ func echo(conn *websocket.Conn) {
 			break
 		}
 
-		w, err := conn.SendMessage(tp)
+		buf, err := io.ReadAll(r)
 		if err != nil {
-			log.Println("cannot create writer:", err)
-			// We need to read the complete message, so that the next
-			// read doesn't block.
-			io.Copy(ioutil.Discard, r)
+			log.Println("read error:", err)
 			break
 		}
 
-		_, err = io.Copy(w, r)
+		w, err := conn.SendMessage(tp)
+		if err != nil {
+			log.Println("cannot create writer:", err)
+			break
+		}
+
+		_, err = w.Write(buf)
 		if err != nil {
 			log.Println("write error:", err)
-			io.Copy(ioutil.Discard, r)
 		}
 
 		err = w.Close()

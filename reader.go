@@ -26,8 +26,8 @@ import (
 
 type readBompel struct {
 	r                *bufio.Reader
-	sendControlFrame chan<- *frame
-	scratch          []byte // buffer for headers and control frame payloads
+	writeBompelStore chan *writeBompel // only used for pong frames
+	scratch          []byte            // buffer for headers and control frame payloads
 	header           header
 	pos              int64
 	closeReason      CloseReason
@@ -93,7 +93,7 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 		close(conn.writeBompelStore)
 
 		var closeStatus Status
-		if clientStatus.serverCanSend() {
+		if closeReason == 0 {
 			closeStatus = clientStatus
 		} else if closeReason == WrongMessageType {
 			closeStatus = StatusUnsupportedType
@@ -125,44 +125,44 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 	close(data.readerDone)
 }
 
-func (b *readBompel) refill(isCont bool) error {
+func (rb *readBompel) refill(isCont bool) error {
 	for {
-		err := b.readFrameHeader()
+		err := rb.readFrameHeader()
 		if err != nil {
 			if err == errFrameFormat {
-				b.closeReason = ProtocolViolation
+				rb.closeReason = ProtocolViolation
 			} else {
-				b.closeReason = ConnDropped
+				rb.closeReason = ConnDropped
 			}
 			return err
 		}
 
-		if b.header.Opcode >= 8 { // control frame
-			if b.header.Length > 125 {
+		if rb.header.Opcode >= 8 { // control frame
+			if rb.header.Length > 125 {
 				// All control frames MUST have a payload length of 125 bytes or less
 				// and MUST NOT be fragmented.
-				b.closeReason = ProtocolViolation
+				rb.closeReason = ProtocolViolation
 				return ErrConnClosed
 			}
-			_, err = io.ReadFull(b.r, b.scratch[:b.header.Length])
+			_, err = io.ReadFull(rb.r, rb.scratch[:rb.header.Length])
 			if err != nil {
-				b.closeReason = ConnDropped
+				rb.closeReason = ConnDropped
 				return err
 			}
-			b.unmask(b.scratch[:b.header.Length])
+			rb.unmask(rb.scratch[:rb.header.Length])
 		}
 
-		switch b.header.Opcode {
+		switch rb.header.Opcode {
 		case Text, Binary:
 			if isCont {
-				b.closeReason = ProtocolViolation
+				rb.closeReason = ProtocolViolation
 				return ErrConnClosed
 			}
 			return nil
 
 		case contFrame:
 			if !isCont {
-				b.closeReason = ProtocolViolation
+				rb.closeReason = ProtocolViolation
 				return ErrConnClosed
 			}
 			return nil
@@ -171,20 +171,30 @@ func (b *readBompel) refill(isCont bool) error {
 			return ErrConnClosed
 
 		case pingFrame:
-			body := make([]byte, b.header.Length)
-			copy(body, b.scratch[:b.header.Length])
-
-			ctl := framePool.Get().(*frame)
-			ctl.Opcode = pongFrame
-			ctl.Body = body
-			ctl.Final = true
-			b.sendControlFrame <- ctl
+			// TODO(voss): can we make this less ugly?
+			body := make([]byte, rb.header.Length)
+			copy(body, rb.scratch[:rb.header.Length])
+			select {
+			case wb := <-rb.writeBompelStore:
+				if wb != nil {
+					wb.sendFrame(pongFrame, body, true)
+					rb.writeBompelStore <- wb
+				}
+			default:
+				go func() {
+					wb := <-rb.writeBompelStore
+					if wb != nil {
+						wb.sendFrame(pongFrame, body, true)
+						rb.writeBompelStore <- wb
+					}
+				}()
+			}
 
 		case pongFrame:
-			// we ignore pong frames
+			// we don't send ping frames and we ignore pong frames
 
 		default:
-			b.closeReason = ProtocolViolation
+			rb.closeReason = ProtocolViolation
 			return ErrConnClosed
 		}
 	}
@@ -263,14 +273,14 @@ func (b *readBompel) unmask(buf []byte) {
 }
 
 type frameReader struct {
-	b        *readBompel
+	rb       *readBompel
 	fromUser chan<- *readBompel
 }
 
 func (fr *frameReader) Read(buf []byte) (int, error) {
-	b := fr.b
-	for b.pos >= b.header.Length && !b.header.Final {
-		err := b.refill(true)
+	rb := fr.rb
+	for rb.pos >= rb.header.Length && !rb.header.Final {
+		err := rb.refill(true)
 		if err != nil {
 			return 0, err
 		}
@@ -278,17 +288,17 @@ func (fr *frameReader) Read(buf []byte) (int, error) {
 	// now there is either data available, or b.final is set (or both)
 
 	amount := len(buf)
-	if int64(amount) > b.header.Length-b.pos {
-		amount = int(b.header.Length - b.pos)
+	if int64(amount) > rb.header.Length-rb.pos {
+		amount = int(rb.header.Length - rb.pos)
 	}
-	n, err := b.r.Read(buf[:amount])
-	b.unmask(buf[:n])
+	n, err := rb.r.Read(buf[:amount])
+	rb.unmask(buf[:n])
 	if err != nil {
-		b.closeReason = ConnDropped
+		rb.closeReason = ConnDropped
 		return n, err
 	}
 
-	if b.pos >= b.header.Length && b.header.Final {
+	if rb.pos >= rb.header.Length && rb.header.Final {
 		err = io.EOF
 	}
 
@@ -331,7 +341,7 @@ func (ac *autoCloseReader) Read(buf []byte) (int, error) {
 	n, err := fr.Read(buf)
 	if err != nil {
 		ac.err = err
-		fr.fromUser <- fr.b
+		fr.fromUser <- fr.rb
 	}
 	return n, err
 }
@@ -349,7 +359,7 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 		return 0, nil, ErrConnClosed
 	}
 
-	fr := &frameReader{b: b, fromUser: conn.fromUser}
+	fr := &frameReader{rb: b, fromUser: conn.fromUser}
 	ac := &autoCloseReader{fr: fr}
 
 	return b.header.Opcode, ac, nil
@@ -373,7 +383,7 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 		return -1, 0, nil, err
 	}
 
-	fr := &frameReader{b: b, fromUser: clients[idx].fromUser}
+	fr := &frameReader{rb: b, fromUser: clients[idx].fromUser}
 	ac := &autoCloseReader{fr: fr}
 
 	return idx, b.header.Opcode, ac, nil
@@ -420,7 +430,7 @@ func (conn *Conn) doReceiveBinary(buf []byte, b *readBompel) (int, error) {
 		return 0, ErrConnClosed
 	}
 
-	r := &frameReader{b: b, fromUser: conn.fromUser}
+	r := &frameReader{rb: b, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
 		b.closeReason = ConnDropped
@@ -463,7 +473,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 	}
 	buf := make([]byte, maxLength)
 
-	r := &frameReader{b: b, fromUser: conn.fromUser}
+	r := &frameReader{rb: b, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
 		b.closeReason = ConnDropped

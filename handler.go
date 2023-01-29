@@ -116,8 +116,9 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 
 	// start the read multiplexer
 	rb := &readBompel{
-		r:       rw.Reader,
-		scratch: make([]byte, 128),
+		r:                rw.Reader,
+		writeBompelStore: conn.writeBompelStore,
+		scratch:          make([]byte, 128),
 	}
 	fromUser := make(chan *readBompel, 1)
 	fromUser <- rb

@@ -175,15 +175,3 @@ type header struct {
 	Final  bool
 	Opcode MessageType
 }
-
-type frame struct {
-	Body   []byte
-	Final  bool
-	Opcode MessageType
-}
-
-var framePool = sync.Pool{
-	New: func() interface{} {
-		return new(frame)
-	},
-}
