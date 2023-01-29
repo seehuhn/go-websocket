@@ -24,80 +24,104 @@ import (
 	"unicode/utf8"
 )
 
-type readMultiplexerData struct {
-	fromUser <-chan *readBompel
-	toUser   chan<- *readBompel
-
-	readerDone chan<- struct{}
-}
-
 type readBompel struct {
 	r                *bufio.Reader
 	sendControlFrame chan<- *frame
 	scratch          []byte // buffer for headers and control frame payloads
 	header           header
 	pos              int64
-	failed           bool
+	closeReason      CloseReason
+}
+
+type readMultiplexerData struct {
+	fromUser   <-chan *readBompel
+	toUser     chan<- *readBompel
+	readerDone chan<- struct{}
 }
 
 // ReadMultiplexer reads all data from the network connection.
 // Control frames are handled internally by this function,
 // data frames are read on behalf of the user.
 func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
-	b := &readBompel{
-		r:                conn.rw.Reader,
-		sendControlFrame: conn.sendControlFrame,
-		scratch:          make([]byte, 128),
-	}
-
+	var rb *readBompel
 	for {
-		b.refill(false)
-		if b.failed || b.header.Opcode == closeFrame {
+		rb = <-data.fromUser
+		if rb.closeReason != 0 {
 			break
 		}
-		data.toUser <- b
-
-		b = <-data.fromUser
-		if b.failed {
+		rb.refill(false)
+		if rb.closeReason != 0 || rb.header.Opcode == closeFrame {
 			break
 		}
+		data.toUser <- rb
 	}
 
 	// Notify the user that no more data will be incoming.
 	close(data.toUser)
 
+	// reason == 0, close
+	// reason != 0, close
+	// reason != 0, other
+
 	// Determine the client status code and message.
+	closeReason := rb.closeReason
 	clientStatus := StatusDropped
 	var clientMessage string
-	if b.header.Opcode == closeFrame && !b.failed {
-		body := b.scratch[:b.header.Length]
-		if len(body) >= 2 {
-			clientStatus = 256*Status(body[0]) + Status(body[1])
-			clientMessage = string(body[2:])
-		} else {
+	if closeReason == 0 && rb.header.Opcode == closeFrame {
+		body := rb.scratch[:rb.header.Length]
+		switch len(body) {
+		case 0:
 			clientStatus = StatusNotSent
+		case 1:
+			closeReason = ProtocolViolation
+		default:
+			tmp := 256*Status(body[0]) + Status(body[1])
+			if tmp.clientCanSend() && utf8.Valid(body[2:]) {
+				clientStatus = tmp
+				clientMessage = string(body[2:])
+			} else {
+				closeReason = ProtocolViolation
+			}
 		}
 	}
-	conn.closeMutex.Lock()
+
+	wb := <-conn.writeBompelStore
+	if wb != nil {
+		// We haven't sent a close frame yet, so we can send one now.
+
+		// no more frames are sent after the close frame
+		close(conn.writeBompelStore)
+
+		var closeStatus Status
+		if clientStatus.serverCanSend() {
+			closeStatus = clientStatus
+		} else if closeReason == WrongMessageType {
+			closeStatus = StatusUnsupportedType
+		} else {
+			closeStatus = StatusProtocolError
+		}
+
+		// TODO(voss): should we check for errors here?
+		wb.sendCloseFrame(closeStatus, nil)
+
+		if closeReason == 0 {
+			closeReason = ClientClosed
+		}
+	} else if closeReason == 0 {
+		closeReason = ServerClosed
+	}
+
+	// Close the TCP connection.
+	// The connection may already be closed at this point, but since we ignore
+	// errors here, this is not a problem.
+	conn.raw.Close()
+
+	conn.closeMutex.Lock() // TODO(voss): can we use readerDone instead?
+	conn.closeReason = closeReason
 	conn.clientStatus = clientStatus
 	conn.clientMessage = clientMessage
 	conn.closeMutex.Unlock()
 
-	// We may already have sent a close frame in the [Conn.Close] method.
-	// Sending a close frame here unconditionally is safe, since the client
-	// will ignore everything after it has received the first close message.
-	//
-	// Since we are exiting anyway, we don't care about errors here.
-	var closeStatus Status
-	if clientStatus.serverCanSend() {
-		closeStatus = clientStatus
-	} else {
-		closeStatus = StatusProtocolError
-	}
-	conn.sendCloseFrame(closeStatus, nil)
-
-	// Closing this will terminate the writer, so this must come after the call
-	// to [Conn.sendCloseFrame].
 	close(data.readerDone)
 }
 
@@ -105,7 +129,11 @@ func (b *readBompel) refill(isCont bool) error {
 	for {
 		err := b.readFrameHeader()
 		if err != nil {
-			b.failed = true
+			if err == errFrameFormat {
+				b.closeReason = ProtocolViolation
+			} else {
+				b.closeReason = ConnDropped
+			}
 			return err
 		}
 
@@ -113,12 +141,12 @@ func (b *readBompel) refill(isCont bool) error {
 			if b.header.Length > 125 {
 				// All control frames MUST have a payload length of 125 bytes or less
 				// and MUST NOT be fragmented.
-				b.failed = true
+				b.closeReason = ProtocolViolation
 				return ErrConnClosed
 			}
 			_, err = io.ReadFull(b.r, b.scratch[:b.header.Length])
 			if err != nil {
-				b.failed = true
+				b.closeReason = ConnDropped
 				return err
 			}
 			b.unmask(b.scratch[:b.header.Length])
@@ -127,27 +155,19 @@ func (b *readBompel) refill(isCont bool) error {
 		switch b.header.Opcode {
 		case Text, Binary:
 			if isCont {
-				b.failed = true
+				b.closeReason = ProtocolViolation
 				return ErrConnClosed
 			}
 			return nil
 
 		case contFrame:
 			if !isCont {
-				b.failed = true
+				b.closeReason = ProtocolViolation
 				return ErrConnClosed
 			}
 			return nil
 
 		case closeFrame:
-			if b.header.Length >= 2 {
-				recvStatus := 256*Status(b.scratch[0]) + Status(b.scratch[1])
-				if !recvStatus.clientCanSend() || !utf8.Valid(b.scratch[2:b.header.Length]) {
-					b.failed = true
-				}
-			} else if b.header.Length == 1 {
-				b.failed = true
-			}
 			return ErrConnClosed
 
 		case pingFrame:
@@ -164,7 +184,7 @@ func (b *readBompel) refill(isCont bool) error {
 			// we ignore pong frames
 
 		default:
-			b.failed = true
+			b.closeReason = ProtocolViolation
 			return ErrConnClosed
 		}
 	}
@@ -264,7 +284,7 @@ func (fr *frameReader) Read(buf []byte) (int, error) {
 	n, err := b.r.Read(buf[:amount])
 	b.unmask(buf[:n])
 	if err != nil {
-		b.failed = true
+		b.closeReason = ConnDropped
 		return n, err
 	}
 
@@ -396,14 +416,14 @@ func (conn *Conn) doReceiveBinary(buf []byte, b *readBompel) (int, error) {
 	defer func() { conn.fromUser <- b }()
 
 	if b.header.Opcode != Binary {
-		b.failed = true
+		b.closeReason = WrongMessageType
 		return 0, ErrConnClosed
 	}
 
 	r := &frameReader{b: b, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
-		b.failed = true
+		b.closeReason = ConnDropped
 	}
 	return n, err
 }
@@ -434,7 +454,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 	defer func() { conn.fromUser <- b }()
 
 	if b.header.Opcode != Text {
-		b.failed = true
+		b.closeReason = WrongMessageType
 		return "", ErrConnClosed
 	}
 
@@ -446,7 +466,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 	r := &frameReader{b: b, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
-		b.failed = true
+		b.closeReason = ConnDropped
 		return "", err
 	}
 
@@ -461,7 +481,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 				break
 			}
 
-			b.failed = true
+			b.closeReason = ProtocolViolation
 			return "", ErrConnClosed
 		}
 		idx += size

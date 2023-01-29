@@ -124,7 +124,7 @@ func (chat *Chat) broadcastMessages(messages <-chan *Message) {
 		chat.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		errors := websocket.BroadcastText(ctx, msgJSON, mm.conns)
+		errors := websocket.BroadcastText(ctx, mm.conns, msgJSON)
 		cancel()
 
 		for i, err := range errors {

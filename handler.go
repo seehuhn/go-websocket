@@ -105,15 +105,22 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 		return nil, err
 	}
 	conn.raw = raw
-	conn.rw = rw
 
-	// start the write multiplexer
-	writerReady := make(chan struct{})
-	go conn.writeMultiplexer(writerReady)
-	<-writerReady
+	// set up the writeBompel
+	wb := &writeBompel{
+		w:      rw.Writer,
+		header: [10]byte{},
+	}
+	conn.writeBompelStore = make(chan *writeBompel, 1)
+	conn.writeBompelStore <- wb
 
 	// start the read multiplexer
+	rb := &readBompel{
+		r:       rw.Reader,
+		scratch: make([]byte, 128),
+	}
 	fromUser := make(chan *readBompel, 1)
+	fromUser <- rb
 	toUser := make(chan *readBompel, 1)
 	readerDone := make(chan struct{})
 	conn.fromUser = fromUser

@@ -472,10 +472,12 @@ func TestClientStatusCode(t *testing.T) {
 				t.Error("server invented a body: " + string(body))
 			}
 		}
+
 		err = client.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		recv := <-c
 		if recv.status != test.expectedCode || recv.message != test.expectedMessage {
 			t.Errorf("%d wrong status code/message: received %d/%s, expected %d/%s",

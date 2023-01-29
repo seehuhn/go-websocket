@@ -71,7 +71,6 @@ func TestReceiveBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
 
 	// send one byte
 	err = client.SendFrame(Binary, []byte{1})
@@ -144,6 +143,15 @@ func TestReceiveEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	tp, _, err := client.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tp != closeFrame {
+		t.Errorf("expected close frame, got %s", tp)
+	}
+
 	err = client.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -192,6 +200,14 @@ func TestReceiveWrongType(t *testing.T) {
 	err = client.SendFrame(Text, []byte{65})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	tp, _, err := client.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tp != closeFrame {
+		t.Errorf("expected close frame, got %s", tp)
 	}
 
 	err = client.Close()

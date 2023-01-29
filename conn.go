@@ -17,12 +17,10 @@
 package websocket
 
 import (
-	"bufio"
 	"fmt"
 	"net"
 	"net/url"
 	"sync"
-	"time"
 )
 
 // Conn represents a websocket connection initiated by a client.  All fields
@@ -39,26 +37,32 @@ type Conn struct {
 	RequestData  interface{} // as returned by Handler.AccessAllowed()
 
 	raw net.Conn
-	rw  *bufio.ReadWriter
+
+	writeBompelStore chan *writeBompel
 
 	// ReaderDone is closed when the reader goroutine has finished.
 	// After this point, the reader will not access the Conn object
 	// any more and will not send any more control messages.
 	readerDone <-chan struct{}
-
-	toUser   <-chan *readBompel
-	fromUser chan<- *readBompel
-
-	writerDone <-chan struct{}
-
-	getFrameWriter   <-chan *frameWriter
-	sendControlFrame chan<- *frame
+	toUser     <-chan *readBompel
+	fromUser   chan<- *readBompel
 
 	closeMutex    sync.Mutex
-	isClosed      bool // no more messages can be sent
+	closeReason   CloseReason
 	clientStatus  Status
 	clientMessage string
 }
+
+type CloseReason int
+
+const (
+	noReason CloseReason = iota
+	ServerClosed
+	ClientClosed
+	ProtocolViolation
+	WrongMessageType
+	ConnDropped
+)
 
 // MessageType encodes the type of a websocket message.
 type MessageType byte
@@ -163,87 +167,6 @@ func (conn *Conn) GetStatus() (Status, string) {
 		status = StatusDropped
 	}
 	return status, conn.clientMessage
-}
-
-// Close terminates a websocket connection and frees all associated resources.
-// The connection cannot be used any more after Close() has been called.
-//
-// The status code indicates whether the connection completed successfully, or
-// due to an error.  Use StatusOK for normal termination, and one of the other
-// status codes in case of errors. Use StatusNotSent to not send a status code.
-//
-// The message can be used to provide additional information to the client for
-// debugging.  The utf-8 representation of the string can be at most 123 bytes
-// long, otherwise ErrTooLarge is returned.
-func (conn *Conn) Close(code Status, message string) error {
-	if !(code.serverCanSend() || code == StatusNotSent) {
-		return ErrStatusCode
-	}
-
-	body := []byte(message)
-	if len(body) > 125-2 {
-		return ErrTooLarge
-	}
-
-	err := conn.sendCloseFrame(code, body)
-	if err != nil {
-		return err
-	}
-
-	// Give the client 3 seconds to close the connection, before closing it
-	// from our end.
-	needsClose := true
-	timeOut := time.NewTimer(3 * time.Second)
-	select {
-	case <-conn.readerDone:
-		if !timeOut.Stop() {
-			<-timeOut.C
-		}
-	case <-timeOut.C:
-		conn.raw.Close() // force-stop the reader
-		needsClose = false
-	}
-
-	// The reader uses conn.sendControlFrame, so we must be sure the
-	// reader has stopped before we can stop the writer by closing
-	// [conn.sendControlFrame].
-	<-conn.readerDone
-
-	conn.closeMutex.Lock()
-	if !conn.isClosed {
-		close(conn.sendControlFrame)
-		conn.isClosed = true
-	}
-	conn.closeMutex.Unlock()
-
-	if needsClose {
-		<-conn.writerDone
-		conn.raw.Close()
-	}
-
-	return nil
-}
-
-func (conn *Conn) sendCloseFrame(status Status, body []byte) error {
-	var buf []byte
-	if status != StatusNotSent {
-		buf = make([]byte, 2+len(body))
-		buf[0] = byte(status >> 8)
-		buf[1] = byte(status)
-		copy(buf[2:], body)
-	}
-	ctl := framePool.Get().(*frame)
-	ctl.Opcode = closeFrame
-	ctl.Body = buf
-	ctl.Final = true
-
-	conn.closeMutex.Lock()
-	defer conn.closeMutex.Unlock()
-	if conn.isClosed {
-		return ErrConnClosed
-	}
-	conn.sendControlFrame <- ctl
-	return nil
 }
 
 type header struct {

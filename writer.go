@@ -17,229 +17,32 @@
 package websocket
 
 import (
+	"bufio"
 	"context"
 	"io"
-	"reflect"
+	"time"
 )
 
 const maxHeaderSize = 10
 
-// SendText sends a text message to the client.
-func (conn *Conn) SendText(msg string) error {
-	return conn.sendData(Text, []byte(msg))
+type writeBompel struct {
+	w      *bufio.Writer
+	header [maxHeaderSize]byte
 }
 
-// SendBinary sends a binary message to the client.
-//
-// For streaming large messages, use SendMessage() instead.
-func (conn *Conn) SendBinary(msg []byte) error {
-	return conn.sendData(Binary, msg)
-}
-
-func (conn *Conn) sendData(opcode MessageType, data []byte) error {
-	// Get the frameWriter just to reserve the data channel, but we
-	// just send the data manually in one frame, rather than using the
-	// Write() method.
-	w := <-conn.getFrameWriter
-	if w == nil {
-		return ErrConnClosed
-	}
-
-	msg := framePool.Get().(*frame)
-	msg.Opcode = opcode
-	msg.Body = data
-	msg.Final = true
-	w.Send <- msg
-
-	err := <-w.Result
-	w.Done <- w
-	return err
-}
-
-// BroadcastText sends a text message to all of the given clients.
-func BroadcastText(ctx context.Context, msg string, clients []*Conn) map[int]error {
-	return broadcastData(ctx, Text, []byte(msg), clients)
-}
-
-// BroadcastBinary sends a binary message to all of the given clients.
-func BroadcastBinary(ctx context.Context, data []byte, clients []*Conn) map[int]error {
-	return broadcastData(ctx, Binary, data, clients)
-}
-
-func broadcastData(ctx context.Context, opcode MessageType, data []byte, clients []*Conn) map[int]error {
-	numClients := len(clients)
-	cases := make([]reflect.SelectCase, numClients, numClients+1)
-	writers := make([]*frameWriter, numClients)
-	errors := make(map[int]error)
-
-	disabled := reflect.Zero(reflect.ChanOf(reflect.BothDir,
-		reflect.TypeOf(&frameReader{})))
-
-	// each client goes through the following stages:
-	//   * w := <-conn.getFrameWriter (abort with error if nil)
-	//     - We are here while writers[i] == nil
-	//
-	//   * w.Send <- data
-	//     - We are here while writers[i] != nil && cases[i].Chan != disabled
-	//
-	//   * err := <-w.Result
-	//     - We are here while writers[i] != nil && cases[i].Chan != disabled
-	//
-	//   * w.Done <- w (Done channel is buffered, cannot hang)
-	//     - We are here if cases[i].Chan == disabled
-
-	for i, conn := range clients {
-		cases[i] = reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(conn.getFrameWriter),
-		}
-	}
-	done := ctx.Done()
-	if done != nil {
-		cases = append(cases, reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(done),
-		})
-	}
-
-	todo := numClients
-mainLoop:
-	for todo > 0 {
-		idx, recv, recvOK := reflect.Select(cases)
-
-		switch {
-		case idx == numClients:
-			// the context was cancelled
-			err := ctx.Err()
-			for i := 0; i < numClients; i++ {
-				if cases[i].Chan != disabled {
-					errors[i] = err
-				}
-			}
-			break mainLoop
-		case writers[idx] == nil:
-			if !recvOK {
-				errors[idx] = ErrConnClosed
-				cases[idx].Chan = disabled
-				todo--
-				continue mainLoop
-			}
-			// w := <-conn.getFrameWriter has succeeded,
-			// send the data next
-			w := recv.Interface().(*frameWriter)
-			writers[idx] = w
-
-			msg := framePool.Get().(*frame)
-			msg.Opcode = opcode
-			msg.Body = data
-			msg.Final = true
-
-			cases[idx].Dir = reflect.SelectSend
-			cases[idx].Chan = reflect.ValueOf(w.Send)
-			cases[idx].Send = reflect.ValueOf(msg)
-		case cases[idx].Dir == reflect.SelectSend:
-			// w.Send <- data has succeeded,
-			// read the error next
-			cases[idx].Dir = reflect.SelectRecv
-			cases[idx].Chan = reflect.ValueOf(writers[idx].Result)
-			cases[idx].Send = reflect.Value{}
-		default:
-			// err := <-w.Result has succeded,
-			// after this we are done
-			w := writers[idx]
-			w.Done <- w
-			err := recv.Interface()
-			if err != nil {
-				errors[idx] = err.(error)
-			}
-			writers[idx] = nil
-			cases[idx].Chan = disabled
-			todo--
-		}
-	}
-
-	return errors
-}
-
-// SendMessage starts a new message and returns an io.WriteCloser
-// which can be used to send the message body.  The argument tp gives
-// the message type (Text or Binary).  Text messages must be sent in
-// utf-8 encoded form.
-func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
-	if tp != Text && tp != Binary {
-		return nil, ErrMessageType
-	}
-	w := <-conn.getFrameWriter
-	if w == nil {
-		return nil, ErrConnClosed
-	}
-
-	w.Pos = 0
-	w.Opcode = tp
-	return w, nil
-}
-
-type frameWriter struct {
-	Buffer []byte
-	Send   chan<- *frame
-	Result <-chan error
-	Done   chan<- *frameWriter
-	Pos    int
-	Opcode MessageType
-}
-
-func (w *frameWriter) Write(buf []byte) (total int, err error) {
-	for {
-		n := copy(w.Buffer[w.Pos:], buf)
-		total += n
-		w.Pos += n
-		buf = buf[n:]
-
-		if len(buf) == 0 {
-			return
-		}
-
-		msg := framePool.Get().(*frame)
-		msg.Opcode = w.Opcode
-		msg.Body = w.Buffer
-		msg.Final = false
-		w.Send <- msg
-
-		w.Pos = 0
-		w.Opcode = contFrame
-
-		err = <-w.Result
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (w *frameWriter) Close() error {
-	msg := framePool.Get().(*frame)
-	msg.Opcode = w.Opcode
-	msg.Body = w.Buffer[:w.Pos]
-	msg.Final = true
-	w.Send <- msg
-
-	err := <-w.Result
-	w.Done <- w // put back the frameWriter for the next user
-	return err
-}
-
-func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error {
-	var header [maxHeaderSize]byte
-
+func (wb *writeBompel) sendFrame(opcode MessageType, body []byte, final bool) error {
+	header := wb.header[:]
 	header[0] = byte(opcode)
 	if final {
 		header[0] |= 128
 	}
 
-	l := uint64(len(body))
-	n := 2
+	l := len(body)
+	var n int
 	switch {
 	case l < 126:
 		header[1] = byte(l)
+		n = 2
 	case l < (1 << 16):
 		header[1] = 126
 		header[2] = byte(l >> 8)
@@ -258,87 +61,162 @@ func (conn *Conn) writeFrame(opcode MessageType, body []byte, final bool) error 
 		n = 10
 	}
 
-	_, err := conn.rw.Write(header[:n])
+	_, err := wb.w.Write(header[:n])
 	if err != nil {
 		return err
 	}
-	_, err = conn.rw.Write(body)
+	_, err = wb.w.Write(body)
 	if err != nil {
 		return err
 	}
-	return conn.rw.Flush()
+	if final {
+		return wb.w.Flush()
+	}
+	return nil
 }
 
-// writeFrames multiplexes all output to the network channel.
-// Shutdown is initiated by sending a close frame via
-// conn.sendControlFrame.  After this, the function drains all
-// channels, returning ErrConnClosed for all write attempts, and
-// terminates once conn.sendControlFrame is closed.
-func (conn *Conn) writeMultiplexer(isFunctional chan<- struct{}) {
-	writerDone := make(chan struct{})
-	controlFrames := make(chan *frame, 1)
-	fwChan := make(chan *frameWriter, 1)
-
-	conn.writerDone = writerDone
-	conn.sendControlFrame = controlFrames
-	conn.getFrameWriter = fwChan
-	close(isFunctional)
-
-	dataBufferSize := conn.rw.Writer.Size() - maxHeaderSize
-	if dataBufferSize < 512-maxHeaderSize {
-		dataBufferSize = 512 - maxHeaderSize
+func (wb *writeBompel) sendCloseFrame(status Status, body []byte) error {
+	var buf []byte
+	if status != StatusNotSent {
+		buf = make([]byte, 2+len(body))
+		buf[0] = byte(status >> 8)
+		buf[1] = byte(status)
+		copy(buf[2:], body)
 	}
-	dataFrames := make(chan *frame, 1)
-	resChan := make(chan error, 1)
+	return wb.sendFrame(closeFrame, buf, true)
+}
+
+type frameWriter struct {
+	*writeBompel
+	store chan<- *writeBompel
+	tp    MessageType
+}
+
+func (w *frameWriter) Write(p []byte) (int, error) {
+	err := w.sendFrame(w.tp, p, false)
+	if err != nil {
+		// TODO(voss): close the connection
+		return 0, err
+	}
+	w.tp = contFrame
+	return len(p), nil
+}
+
+func (w *frameWriter) Close() error {
+	// send the final frame
+	err := w.sendFrame(w.tp, nil, true)
+	if err != nil {
+		// TODO(voss): close the connection
+		return err
+	}
+
+	wb := w.writeBompel
+	w.writeBompel = nil
+	w.store <- wb
+	return nil
+}
+
+// Close terminates a websocket connection and frees all associated resources.
+// The connection cannot be used any more after Close() has been called.
+//
+// The status code indicates whether the connection completed successfully, or
+// due to an error.  Use StatusOK for normal termination, and one of the other
+// status codes in case of errors. Use StatusNotSent to not send a status code.
+//
+// The message can be used to provide additional information to the client for
+// debugging.  The utf-8 representation of the string can be at most 123 bytes
+// long, otherwise ErrTooLarge is returned.
+func (conn *Conn) Close(code Status, message string) error {
+	if !(code.serverCanSend() || code == StatusNotSent) {
+		return ErrStatusCode
+	}
+
+	body := []byte(message)
+	if len(body) > 125-2 {
+		return ErrTooLarge
+	}
+
+	wb := <-conn.writeBompelStore
+	if wb != nil {
+		close(conn.writeBompelStore) // prevent further writes
+
+		err := wb.sendCloseFrame(code, body)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Give the client 3 seconds to close the connection, before closing it
+	// from our end.
+	go func() {
+		timeOut := time.NewTimer(3 * time.Second)
+		select {
+		case <-conn.readerDone:
+			if !timeOut.Stop() {
+				<-timeOut.C
+			}
+		case <-timeOut.C:
+			conn.raw.Close() // force-stop the reader
+		}
+	}()
+
+	return nil
+}
+
+// SendMessage starts a new message and returns an io.WriteCloser
+// which can be used to send the message body.  The argument tp gives
+// the message type (Text or Binary).  Text messages must be sent in
+// utf-8 encoded form.
+func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
+	wb := <-conn.writeBompelStore
+	if wb == nil {
+		return nil, ErrConnClosed
+	}
+
 	w := &frameWriter{
-		Buffer: make([]byte, dataBufferSize),
-		Send:   dataFrames,
-		Result: resChan,
-		Done:   fwChan,
+		writeBompel: wb,
+		store:       conn.writeBompelStore,
+		tp:          tp,
 	}
-	fwChan <- w
+	return w, nil
+}
 
-writerLoop:
-	for {
-		select {
-		case frame := <-dataFrames:
-			err := conn.writeFrame(frame.Opcode, frame.Body, frame.Final)
-			resChan <- err
-
-			frame.Body = nil
-			framePool.Put(frame)
-		case frame, ok := <-controlFrames:
-			if !ok {
-				break writerLoop
-			}
-			// TODO(voss): what to do, if there is a write error?
-			conn.writeFrame(frame.Opcode, frame.Body, true)
-			op := frame.Opcode
-
-			frame.Body = nil
-			framePool.Put(frame)
-
-			if op == closeFrame {
-				break writerLoop
-			}
-		}
+// SendBinary sends a binary message to the client.
+//
+// For streaming large messages, use SendMessage() instead.
+func (conn *Conn) SendBinary(msg []byte) error {
+	wb := <-conn.writeBompelStore
+	if wb == nil {
+		return ErrConnClosed
 	}
 
-	// from this point onwards we don't write to the connection any more
-	close(writerDone)
-
-drainLoop:
-	for {
-		select {
-		case <-fwChan:
-			close(fwChan)
-			fwChan = nil
-		case <-dataFrames:
-			resChan <- ErrConnClosed
-		case _, ok := <-controlFrames:
-			if !ok {
-				break drainLoop
-			}
-		}
+	err := wb.sendFrame(Binary, msg, true)
+	if err != nil {
+		return err
 	}
+
+	conn.writeBompelStore <- wb
+
+	return nil
+}
+
+// SendText sends a text message to the client.
+func (conn *Conn) SendText(msg string) error {
+	wb := <-conn.writeBompelStore
+	if wb == nil {
+		return ErrConnClosed
+	}
+
+	err := wb.sendFrame(Text, []byte(msg), true)
+	if err != nil {
+		return err
+	}
+
+	conn.writeBompelStore <- wb
+
+	return nil
+}
+
+func BroadcastText(ctx context.Context, clients []*Conn, msg string) map[int]error {
+	panic("not implemented")
 }
