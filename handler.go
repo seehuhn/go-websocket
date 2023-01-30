@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Handler implements the http.Handler interface.  The handler
@@ -41,7 +42,7 @@ type Handler struct {
 	// that the request should be blocked).
 	// In addition, the function can return information from the request
 	// (e.g. login details extracted from cookies).  The returned value is
-	// then stored in the Conn.RequestData field.
+	// stored in the [Conn.RequestData] field.
 	AccessAllowed func(r *http.Request) (bool, interface{})
 
 	// Handle is called after the websocket handshake has completed
@@ -50,7 +51,7 @@ type Handler struct {
 	//
 	// The connection object conn can be passed to other parts of the
 	// programm, and will stay functional even after the call to
-	// Handle is complete.  Use conn.Close() to close the connection
+	// Handle is complete.  Use [conn.Close] to close the connection
 	// after use.
 	Handle func(conn *Conn)
 
@@ -63,11 +64,6 @@ type Handler struct {
 	// this list, or null (no Sec-WebSocket-Protocol header sent) if none of
 	// the client-requested subprotocols are supported.
 	Subprotocols []string
-
-	// AccessOK should not be used in new code.
-	//
-	// Deprecated: Use OriginAllowed and/or AccessAllowed instead.
-	AccessOk func(conn *Conn, protocols []string) bool
 }
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" // from RFC 6455
@@ -83,8 +79,7 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // Upgrade upgrades an HTTP connection to the websocket protocol.
-// After this function returns, `w` and `req` cannot be used any more
-// (even in the case of an error).
+// After this function returns, `w` and `req` cannot be used any more.
 func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn, error) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -104,44 +99,89 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return nil, err
 	}
+	raw.SetDeadline(time.Time{})
+
+	// fill in the remaining fields of the Conn object
 	conn.raw = raw
 
-	// set up the writeBompel
-	wb := &writeBompel{
+	wb := &sender{
 		w:      rw.Writer,
 		header: [10]byte{},
 	}
-	conn.writeBompelStore = make(chan *writeBompel, 1)
-	conn.writeBompelStore <- wb
+	conn.senderStore = make(chan *sender, 1)
+	conn.senderStore <- wb
 
-	// start the read multiplexer
-	rb := &readBompel{
-		r:                rw.Reader,
-		writeBompelStore: conn.writeBompelStore,
-		scratch:          make([]byte, 128),
+	rb := &reader{
+		r:           rw.Reader,
+		senderStore: conn.senderStore,
+		scratch:     make([]byte, 128),
 	}
-	fromUser := make(chan *readBompel, 1)
+	fromUser := make(chan *reader, 1)
 	fromUser <- rb
-	toUser := make(chan *readBompel, 1)
+	toUser := make(chan *reader, 1)
 	readerDone := make(chan struct{})
 	conn.fromUser = fromUser
 	conn.toUser = toUser
 	conn.readerDone = readerDone
-	data := &readMultiplexerData{
+
+	// Start the read multiplexer goroutine.  This goroutine will
+	// manages the connection and closes the TCP connection when
+	// the websocket connection is closed.
+	go conn.readMultiplexer(&readMultiplexerData{
 		fromUser:   fromUser,
 		toUser:     toUser,
 		readerDone: readerDone,
-	}
-	go conn.readMultiplexer(data)
+	})
 
 	return conn, nil
 }
 
 func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Conn, int) {
+	// This code is organised following the steps in section 4.2 of RFC 6455,
+	// see https://www.rfc-editor.org/rfc/rfc6455#section-4.2 .
+
+	// The method of the request MUST be GET, and the HTTP version MUST be at
+	// least 1.1.
 	if req.Method != "GET" || req.ProtoMajor == 1 && req.ProtoMinor == 0 {
 		return nil, http.StatusBadRequest
 	}
 
+	var resourceName string
+	origURI, err := url.ParseRequestURI(req.RequestURI)
+	if err != nil {
+		return nil, http.StatusBadRequest
+	}
+	path := origURI.Path
+	if path == "" {
+		path = "/"
+	}
+	query := origURI.RawQuery
+	if query != "" {
+		query = "&" + query
+	}
+	resourceName = path + query
+
+	// The request MUST contain an |Upgrade| header field whose value MUST
+	// include the "websocket" keyword.
+	if !containsTokenFold(req.Header.Values("Upgrade"), "websocket") {
+		return nil, http.StatusBadRequest
+	}
+
+	// The request MUST contain a |Connection| header field whose value MUST
+	// include the "Upgrade" token.
+	if !containsTokenFold(req.Header.Values("Connection"), "upgrade") {
+		return nil, http.StatusBadRequest
+	}
+
+	// The request MUST include a header field with the name
+	// |Sec-WebSocket-Key|.
+	secWebsocketKey := req.Header.Get("Sec-Websocket-Key")
+	if secWebsocketKey == "" {
+		return nil, http.StatusBadRequest
+	}
+
+	// The request MUST include a header field with the name
+	// |Sec-WebSocket-Version|.  The value of this header field MUST be 13.
 	version := req.Header.Get("Sec-Websocket-Version")
 	if version != "13" {
 		headers := w.Header()
@@ -150,136 +190,118 @@ func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Co
 		headers.Set("Sec-WebSocket-Version", "13")
 		return nil, http.StatusUpgradeRequired
 	}
-	if strings.ToLower(req.Header.Get("Upgrade")) != "websocket" {
-		return nil, http.StatusBadRequest
-	}
-	connection := strings.ToLower(req.Header.Get("Connection"))
-	if !strings.Contains(connection, "upgrade") {
-		return nil, http.StatusBadRequest
-	}
-	key := req.Header.Get("Sec-Websocket-Key")
-	if key == "" {
-		return nil, http.StatusBadRequest
-	}
+
+	subprotocol := handler.chooseSubprotocol(req)
 
 	// protect against CSRF attacks
-	var originURI *url.URL
-	origin := req.Header.Get("Origin")
-	if origin != "" {
-		var err error
-		originURI, err = url.ParseRequestURI(origin)
+	var origin *url.URL
+	if origins := req.Header.Values("Origin"); len(origins) > 0 {
+		originURI, err := url.ParseRequestURI(origins[0])
 		if err != nil {
 			return nil, http.StatusBadRequest
 		}
-	}
-	var originAllowed bool
-	if handler.OriginAllowed != nil {
-		originAllowed = handler.OriginAllowed(originURI)
-	} else {
-		originAllowed = originURI == nil || originURI.Host == req.Host
-	}
-	if !originAllowed {
-		return nil, http.StatusForbidden
+		origin = originURI
+
+		var originAllowed bool
+		if handler.OriginAllowed != nil {
+			originAllowed = handler.OriginAllowed(origin)
+		} else {
+			originAllowed = strings.EqualFold(origin.Host, req.Host)
+		}
+		if !originAllowed {
+			return nil, http.StatusForbidden
+		}
 	}
 
-	conn := &Conn{
-		RemoteAddr: req.RemoteAddr,
-	}
-
+	// access control
+	var requestData interface{}
 	if handler.AccessAllowed != nil {
 		ok, data := handler.AccessAllowed(req)
 		if !ok {
 			return nil, http.StatusForbidden
 		}
-		conn.RequestData = data
+		requestData = data
 	}
 
-	origURI, err := url.ParseRequestURI(req.RequestURI)
-	if err == nil {
-		path := origURI.Path
-		if path == "" {
-			path = "/"
-		}
-		query := origURI.RawQuery
-		if query != "" {
-			query = "&" + query
-		}
-		conn.ResourceName = path + query
-	}
+	// if we reach this point, we accept the connection
 
-	var clientProtos []string
-	for _, protocol := range req.Header["Sec-Websocket-Protocol"] {
-		pp := strings.Split(protocol, ",")
-		for i := 0; i < len(pp); i++ {
-			p := strings.TrimSpace(pp[i])
-			if p != "" {
-				clientProtos = append(clientProtos, p)
-			}
-		}
-	}
-	if len(clientProtos) > 0 {
-		protoMap := make(map[string]bool)
-		for _, p := range clientProtos {
-			protoMap[p] = true
-		}
-		for _, p := range handler.Subprotocols {
-			if protoMap[p] {
-				conn.Protocol = p
-				break
-			}
-		}
-	}
-
-	if handler.AccessAllowed == nil && handler.AccessOk != nil {
-		// handle legacy clients
-		ok := handler.AccessOk(conn, clientProtos)
-		if !ok {
-			return nil, http.StatusForbidden
-		}
+	conn := &Conn{
+		ResourceName: resourceName,
+		Origin:       origin,
+		RemoteAddr:   req.RemoteAddr,
+		Protocol:     subprotocol,
+		RequestData:  requestData,
 	}
 
 	h := sha1.New()
-	h.Write([]byte(key))
+	h.Write([]byte(secWebsocketKey))
 	h.Write([]byte(websocketGUID))
-	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	secWebsocketAccept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
 	headers := w.Header()
 	headers.Set("Upgrade", "websocket")
 	headers.Set("Connection", "Upgrade")
-	headers.Set("Sec-WebSocket-Version", "13")
-	if conn.Protocol != "" {
-		headers.Set("Sec-WebSocket-Protocol", conn.Protocol)
+	headers.Set("Sec-WebSocket-Accept", secWebsocketAccept)
+	if subprotocol != "" {
+		headers.Set("Sec-WebSocket-Protocol", subprotocol)
 	}
-	headers.Set("Sec-WebSocket-Accept", accept)
 	if handler.ServerName != "" {
 		headers.Set("Server", handler.ServerName)
 	}
+
 	return conn, http.StatusSwitchingProtocols
 }
 
-// containsToken reports whether s contains token as a token.
-// The comparison is case-insensitive.
-// token must be lower case.
-func containsToken(s, token string) bool {
-	pos := 0
-	n := len(s)
-
-	// skip to the first token
-	for pos < n && !isTokenByte[s[pos]] {
-		pos++
+func (handler *Handler) chooseSubprotocol(req *http.Request) string {
+	serverProtos := handler.Subprotocols
+	if len(serverProtos) == 0 {
+		return ""
 	}
 
-	for pos < n {
-		start := pos
-		for pos < n && isTokenByte[s[pos]] {
-			pos++
+	var clientProtos []string
+	pp := strings.Split(req.Header.Get("Sec-Websocket-Protocol"), ",")
+	for i := 0; i < len(pp); i++ {
+		p := strings.TrimSpace(pp[i])
+		if p != "" {
+			clientProtos = append(clientProtos, p)
 		}
-		if strings.ToLower(s[start:pos]) == token {
-			return true
-		}
+	}
 
+	for _, p := range serverProtos {
+		for _, q := range clientProtos {
+			if p == q {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// containsTokenFold reports whether s contains a given token.
+// The comparison is case-insensitive.
+// token must be lower case.
+func containsTokenFold(headers []string, token string) bool {
+	for _, s := range headers {
+		pos := 0
+		n := len(s)
+
+		// skip to the first token
 		for pos < n && !isTokenByte[s[pos]] {
 			pos++
+		}
+
+		for pos < n {
+			start := pos
+			for pos < n && isTokenByte[s[pos]] {
+				pos++
+			}
+			if strings.ToLower(s[start:pos]) == token {
+				return true
+			}
+
+			for pos < n && !isTokenByte[s[pos]] {
+				pos++
+			}
 		}
 	}
 	return false

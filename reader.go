@@ -24,18 +24,18 @@ import (
 	"unicode/utf8"
 )
 
-type readBompel struct {
-	r                *bufio.Reader
-	writeBompelStore chan *writeBompel // only used for pong frames
-	scratch          []byte            // buffer for headers and control frame payloads
-	header           header
-	pos              int64
-	closeReason      CloseReason
+type reader struct {
+	r           *bufio.Reader
+	senderStore chan *sender // only used for pong frames
+	scratch     []byte       // buffer for headers and control frame payloads
+	header      frameHeader
+	pos         int64
+	connInfo    ConnInfo
 }
 
 type readMultiplexerData struct {
-	fromUser   <-chan *readBompel
-	toUser     chan<- *readBompel
+	fromUser   <-chan *reader
+	toUser     chan<- *reader
 	readerDone chan<- struct{}
 }
 
@@ -43,14 +43,18 @@ type readMultiplexerData struct {
 // Control frames are handled internally by this function,
 // data frames are read on behalf of the user.
 func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
-	var rb *readBompel
+	var rb *reader
 	for {
 		rb = <-data.fromUser
-		if rb.closeReason != 0 {
+		if rb.connInfo != 0 {
 			break
 		}
+
+		// Wait until a new data frame is available.
+		// We don't need to check the returned error value, since in case
+		// of error, rb.connInfo is non-zero or rb.header.Opcode == closeFrame.
 		rb.refill(false)
-		if rb.closeReason != 0 || rb.header.Opcode == closeFrame {
+		if rb.connInfo != 0 || rb.header.Opcode == closeFrame {
 			break
 		}
 		data.toUser <- rb
@@ -64,51 +68,51 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 	// reason != 0, other
 
 	// Determine the client status code and message.
-	closeReason := rb.closeReason
+	connInfo := rb.connInfo
 	clientStatus := StatusDropped
 	var clientMessage string
-	if closeReason == 0 && rb.header.Opcode == closeFrame {
+	if connInfo == 0 && rb.header.Opcode == closeFrame {
 		body := rb.scratch[:rb.header.Length]
 		switch len(body) {
 		case 0:
 			clientStatus = StatusNotSent
 		case 1:
-			closeReason = ProtocolViolation
+			connInfo = ProtocolViolation
 		default:
 			tmp := 256*Status(body[0]) + Status(body[1])
 			if tmp.clientCanSend() && utf8.Valid(body[2:]) {
 				clientStatus = tmp
 				clientMessage = string(body[2:])
 			} else {
-				closeReason = ProtocolViolation
+				connInfo = ProtocolViolation
 			}
 		}
 	}
 
-	wb := <-conn.writeBompelStore
+	wb := <-conn.senderStore
 	if wb != nil {
 		// We haven't sent a close frame yet, so we can send one now.
 
 		// no more frames are sent after the close frame
-		close(conn.writeBompelStore)
+		close(conn.senderStore)
 
 		var closeStatus Status
-		if closeReason == 0 {
+		if connInfo == 0 {
 			closeStatus = clientStatus
-		} else if closeReason == WrongMessageType {
+		} else if connInfo == WrongMessageType {
 			closeStatus = StatusUnsupportedType
 		} else {
 			closeStatus = StatusProtocolError
 		}
 
-		// TODO(voss): should we check for errors here?
+		// TODO(voss): what to do in case of send errors?
 		wb.sendCloseFrame(closeStatus, nil)
 
-		if closeReason == 0 {
-			closeReason = ClientClosed
+		if connInfo == 0 {
+			connInfo = ClientClosed
 		}
-	} else if closeReason == 0 {
-		closeReason = ServerClosed
+	} else if connInfo == 0 {
+		connInfo = ServerClosed
 	}
 
 	// Close the TCP connection.
@@ -116,23 +120,26 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 	// errors here, this is not a problem.
 	conn.raw.Close()
 
-	conn.closeMutex.Lock() // TODO(voss): can we use readerDone instead?
-	conn.closeReason = closeReason
+	conn.connInfo = connInfo
 	conn.clientStatus = clientStatus
 	conn.clientMessage = clientMessage
-	conn.closeMutex.Unlock()
-
 	close(data.readerDone)
 }
 
-func (rb *readBompel) refill(isCont bool) error {
+// Refill reads data from the connection until a data frame is available.
+// Control frames are processed as they are encountered.
+// If an error is returned, rb.connInfo is set to the appropriate value.
+func (rb *reader) refill(isCont bool) error {
+	if rb.header.Opcode == closeFrame {
+		return ErrConnClosed
+	}
 	for {
 		err := rb.readFrameHeader()
 		if err != nil {
 			if err == errFrameFormat {
-				rb.closeReason = ProtocolViolation
+				rb.connInfo = ProtocolViolation
 			} else {
-				rb.closeReason = ConnDropped
+				rb.connInfo = ConnDropped
 			}
 			return err
 		}
@@ -141,12 +148,12 @@ func (rb *readBompel) refill(isCont bool) error {
 			if rb.header.Length > 125 {
 				// All control frames MUST have a payload length of 125 bytes or less
 				// and MUST NOT be fragmented.
-				rb.closeReason = ProtocolViolation
+				rb.connInfo = ProtocolViolation
 				return ErrConnClosed
 			}
 			_, err = io.ReadFull(rb.r, rb.scratch[:rb.header.Length])
 			if err != nil {
-				rb.closeReason = ConnDropped
+				rb.connInfo = ConnDropped
 				return err
 			}
 			rb.unmask(rb.scratch[:rb.header.Length])
@@ -155,14 +162,14 @@ func (rb *readBompel) refill(isCont bool) error {
 		switch rb.header.Opcode {
 		case Text, Binary:
 			if isCont {
-				rb.closeReason = ProtocolViolation
+				rb.connInfo = ProtocolViolation
 				return ErrConnClosed
 			}
 			return nil
 
 		case contFrame:
 			if !isCont {
-				rb.closeReason = ProtocolViolation
+				rb.connInfo = ProtocolViolation
 				return ErrConnClosed
 			}
 			return nil
@@ -172,20 +179,23 @@ func (rb *readBompel) refill(isCont bool) error {
 
 		case pingFrame:
 			// TODO(voss): can we make this less ugly?
+			// TODO(voss): what to do if there is an error sending the pong?
 			body := make([]byte, rb.header.Length)
 			copy(body, rb.scratch[:rb.header.Length])
 			select {
-			case wb := <-rb.writeBompelStore:
+			case wb := <-rb.senderStore:
+				// If the sender is available, send the pong frame immediately.
 				if wb != nil {
 					wb.sendFrame(pongFrame, body, true)
-					rb.writeBompelStore <- wb
+					rb.senderStore <- wb
 				}
 			default:
+				// Otherwise, send the pong frame in a separate goroutine.
 				go func() {
-					wb := <-rb.writeBompelStore
+					wb := <-rb.senderStore
 					if wb != nil {
 						wb.sendFrame(pongFrame, body, true)
-						rb.writeBompelStore <- wb
+						rb.senderStore <- wb
 					}
 				}()
 			}
@@ -194,13 +204,13 @@ func (rb *readBompel) refill(isCont bool) error {
 			// we don't send ping frames and we ignore pong frames
 
 		default:
-			rb.closeReason = ProtocolViolation
+			rb.connInfo = ProtocolViolation
 			return ErrConnClosed
 		}
 	}
 }
 
-func (b *readBompel) readFrameHeader() error {
+func (b *reader) readFrameHeader() error {
 	b0, err := b.r.ReadByte()
 	if err != nil {
 		return err
@@ -265,7 +275,7 @@ func (b *readBompel) readFrameHeader() error {
 	return nil
 }
 
-func (b *readBompel) unmask(buf []byte) {
+func (b *reader) unmask(buf []byte) {
 	for i := range buf {
 		buf[i] ^= b.header.Mask[b.pos&3]
 		b.pos++
@@ -273,8 +283,8 @@ func (b *readBompel) unmask(buf []byte) {
 }
 
 type frameReader struct {
-	rb       *readBompel
-	fromUser chan<- *readBompel
+	rb       *reader
+	fromUser chan<- *reader
 }
 
 func (fr *frameReader) Read(buf []byte) (int, error) {
@@ -294,7 +304,7 @@ func (fr *frameReader) Read(buf []byte) (int, error) {
 	n, err := rb.r.Read(buf[:amount])
 	rb.unmask(buf[:n])
 	if err != nil {
-		rb.closeReason = ConnDropped
+		rb.connInfo = ConnDropped
 		return n, err
 	}
 
@@ -403,17 +413,18 @@ func (conn *Conn) ReceiveBinary(buf []byte) (int, error) {
 	return conn.doReceiveBinary(buf, b)
 }
 
-// ReceiveOneBinary listens on all given connections until a new message
+// SelectBinary listens on all given connections until a new message
 // arrives, and then reads this message.  If the message received is not
 // binary, the channel is closed with status StatusProtocolError and
 // [ErrConnClosed] is returned.
 //
 // If the received message is longer than buf, the buffer contains the start of
-// the message and [ErrTooLarge] is returned.
+// the message and [ErrTooLarge] is returned.  The rest of the message is
+// discarded, the connection stays functional.
 //
 // If the context expires or is cancelled, the error is either
 // context.DeadlineExceeded or context.Cancelled.
-func ReceiveOneBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int, err error) {
+func SelectBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int, err error) {
 	idx, b, err := selectChannel(ctx, clients)
 	if err != nil {
 		return -1, 0, err
@@ -422,18 +433,18 @@ func ReceiveOneBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n 
 	return idx, n, err
 }
 
-func (conn *Conn) doReceiveBinary(buf []byte, b *readBompel) (int, error) {
+func (conn *Conn) doReceiveBinary(buf []byte, b *reader) (int, error) {
 	defer func() { conn.fromUser <- b }()
 
 	if b.header.Opcode != Binary {
-		b.closeReason = WrongMessageType
+		b.connInfo = WrongMessageType
 		return 0, ErrConnClosed
 	}
 
 	r := &frameReader{rb: b, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
-		b.closeReason = ConnDropped
+		b.connInfo = ConnDropped
 	}
 	return n, err
 }
@@ -451,7 +462,18 @@ func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 	return conn.doReceiveText(maxLength, b)
 }
 
-func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (idx int, text string, err error) {
+// SelectText listens on all given connections until a new message arrives, and
+// then reads this message.  If the message received is not a text message, the
+// channel is closed with status StatusProtocolError and [ErrConnClosed] is
+// returned.
+//
+// If the received text is longer maxLength bytes (in utf-8 encoding), only the
+// start of the text together with [ErrTooLarge] is returned.  The rest of the
+// text is discarded, the connection stays functional.
+//
+// If the context expires or is cancelled, the error is either
+// context.DeadlineExceeded or context.Cancelled.
+func SelectText(ctx context.Context, maxLength int, clients []*Conn) (idx int, text string, err error) {
 	idx, b, err := selectChannel(ctx, clients)
 	if err != nil {
 		return -1, "", err
@@ -460,11 +482,11 @@ func ReceiveOneText(ctx context.Context, maxLength int, clients []*Conn) (idx in
 	return idx, text, err
 }
 
-func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
+func (conn *Conn) doReceiveText(maxLength int, b *reader) (string, error) {
 	defer func() { conn.fromUser <- b }()
 
 	if b.header.Opcode != Text {
-		b.closeReason = WrongMessageType
+		b.connInfo = WrongMessageType
 		return "", ErrConnClosed
 	}
 
@@ -476,7 +498,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 	r := &frameReader{rb: b, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
-		b.closeReason = ConnDropped
+		b.connInfo = ConnDropped
 		return "", err
 	}
 
@@ -491,7 +513,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 				break
 			}
 
-			b.closeReason = ProtocolViolation
+			b.connInfo = ProtocolViolation
 			return "", ErrConnClosed
 		}
 		idx += size
@@ -500,7 +522,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *readBompel) (string, error) {
 	return string(buf[:n]), err
 }
 
-func selectChannel(ctx context.Context, clients []*Conn) (int, *readBompel, error) {
+func selectChannel(ctx context.Context, clients []*Conn) (int, *reader, error) {
 	numClients := len(clients)
 	if numClients > 65535 {
 		// select supports at most 65536 cases, and we need one for the context
@@ -535,11 +557,11 @@ func selectChannel(ctx context.Context, clients []*Conn) (int, *readBompel, erro
 			if numClosed == numClients {
 				return -1, nil, ErrConnClosed
 			}
-			cases[idx].Chan = reflect.ValueOf((<-chan *readBompel)(nil))
+			cases[idx].Chan = reflect.ValueOf((<-chan *reader)(nil))
 			continue
 		}
 
-		rb := recv.Interface().(*readBompel)
+		rb := recv.Interface().(*reader)
 		return idx, rb, nil
 	}
 }

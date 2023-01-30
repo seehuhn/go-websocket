@@ -26,12 +26,12 @@ import (
 
 const maxHeaderSize = 10
 
-type writeBompel struct {
+type sender struct {
 	w      *bufio.Writer
 	header [maxHeaderSize]byte
 }
 
-func (wb *writeBompel) sendFrame(opcode MessageType, body []byte, final bool) error {
+func (wb *sender) sendFrame(opcode MessageType, body []byte, final bool) error {
 	header := wb.header[:]
 	header[0] = byte(opcode)
 	if final {
@@ -76,7 +76,7 @@ func (wb *writeBompel) sendFrame(opcode MessageType, body []byte, final bool) er
 	return nil
 }
 
-func (wb *writeBompel) sendCloseFrame(status Status, body []byte) error {
+func (wb *sender) sendCloseFrame(status Status, body []byte) error {
 	var buf []byte
 	if status != StatusNotSent {
 		buf = make([]byte, 2+len(body))
@@ -88,15 +88,14 @@ func (wb *writeBompel) sendCloseFrame(status Status, body []byte) error {
 }
 
 type frameWriter struct {
-	*writeBompel
-	store chan<- *writeBompel
+	*sender
+	store chan<- *sender
 	tp    MessageType
 }
 
 func (w *frameWriter) Write(p []byte) (int, error) {
 	err := w.sendFrame(w.tp, p, false)
 	if err != nil {
-		// TODO(voss): close the connection
 		return 0, err
 	}
 	w.tp = contFrame
@@ -107,12 +106,11 @@ func (w *frameWriter) Close() error {
 	// send the final frame
 	err := w.sendFrame(w.tp, nil, true)
 	if err != nil {
-		// TODO(voss): close the connection
 		return err
 	}
 
-	wb := w.writeBompel
-	w.writeBompel = nil
+	wb := w.sender
+	w.sender = nil
 	w.store <- wb
 	return nil
 }
@@ -137,13 +135,14 @@ func (conn *Conn) Close(code Status, message string) error {
 		return ErrTooLarge
 	}
 
-	wb := <-conn.writeBompelStore
+	wb := <-conn.senderStore
 	if wb != nil {
-		close(conn.writeBompelStore) // prevent further writes
+		close(conn.senderStore) // prevent further writes
 
 		err := wb.sendCloseFrame(code, body)
 		if err != nil {
-			return err
+			conn.raw.Close()
+			return ErrConnClosed
 		}
 	}
 
@@ -169,15 +168,15 @@ func (conn *Conn) Close(code Status, message string) error {
 // the message type (Text or Binary).  Text messages must be sent in
 // utf-8 encoded form.
 func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
-	wb := <-conn.writeBompelStore
+	wb := <-conn.senderStore
 	if wb == nil {
 		return nil, ErrConnClosed
 	}
 
 	w := &frameWriter{
-		writeBompel: wb,
-		store:       conn.writeBompelStore,
-		tp:          tp,
+		sender: wb,
+		store:  conn.senderStore,
+		tp:     tp,
 	}
 	return w, nil
 }
@@ -186,7 +185,7 @@ func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
 //
 // For streaming large messages, use SendMessage() instead.
 func (conn *Conn) SendBinary(msg []byte) error {
-	wb := <-conn.writeBompelStore
+	wb := <-conn.senderStore
 	if wb == nil {
 		return ErrConnClosed
 	}
@@ -196,14 +195,14 @@ func (conn *Conn) SendBinary(msg []byte) error {
 		return err
 	}
 
-	conn.writeBompelStore <- wb
+	conn.senderStore <- wb
 
 	return nil
 }
 
 // SendText sends a text message to the client.
 func (conn *Conn) SendText(msg string) error {
-	wb := <-conn.writeBompelStore
+	wb := <-conn.senderStore
 	if wb == nil {
 		return ErrConnClosed
 	}
@@ -213,15 +212,23 @@ func (conn *Conn) SendText(msg string) error {
 		return err
 	}
 
-	conn.writeBompelStore <- wb
+	conn.senderStore <- wb
 
 	return nil
 }
 
+// BroadcastBinary sends a binary message to all clients in the
+// given slice.  The return value contains all errors that occurred
+// during sending.  The keys of the map are the indices of the
+// clients in the slice.
 func BroadcastBinary(ctx context.Context, clients []*Conn, msg []byte) map[int]error {
 	return doBroadcast(ctx, clients, Binary, msg)
 }
 
+// BroadcastBinary sends a text message to all clients in the
+// given slice.  The return value contains all errors that occurred
+// during sending.  The keys of the map are the indices of the
+// clients in the slice.
 func BroadcastText(ctx context.Context, clients []*Conn, msg string) map[int]error {
 	return doBroadcast(ctx, clients, Text, []byte(msg))
 }
@@ -238,7 +245,7 @@ func doBroadcast(ctx context.Context, clients []*Conn, tp MessageType, msg []byt
 	for i, conn := range clients {
 		cases[i] = reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(conn.writeBompelStore),
+			Chan: reflect.ValueOf(conn.senderStore),
 		}
 	}
 	cases[numClients] = reflect.SelectCase{
@@ -247,7 +254,7 @@ func doBroadcast(ctx context.Context, clients []*Conn, tp MessageType, msg []byt
 	}
 
 	disabled := reflect.Zero(reflect.ChanOf(reflect.BothDir,
-		reflect.TypeOf(&writeBompel{})))
+		reflect.TypeOf(&sender{})))
 	todo := numClients
 	errors := make(map[int]error)
 mainLoop:
@@ -274,13 +281,13 @@ mainLoop:
 			continue mainLoop
 		}
 
-		wb := recv.Interface().(*writeBompel)
+		wb := recv.Interface().(*sender)
 		err := wb.sendFrame(tp, msg, true)
 		if err != nil {
 			errors[idx] = err
 			continue mainLoop
 		}
-		clients[idx].writeBompelStore <- wb
+		clients[idx].senderStore <- wb
 	}
 	return errors
 }

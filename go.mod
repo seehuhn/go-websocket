@@ -7,4 +7,4 @@ retract (
 	v1.1.0 // Published prematurely.
 )
 
-require go.uber.org/goleak v1.2.0 // indirect
+require go.uber.org/goleak v1.2.0

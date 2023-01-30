@@ -81,7 +81,7 @@ func (chat *Chat) receiveMessages() {
 		ctx := nextCtx
 		lock.Unlock()
 
-		idx, msgText, err := websocket.ReceiveOneText(ctx, 1024, members.conns)
+		idx, msgText, err := websocket.SelectText(ctx, 1024, members.conns)
 		if idx < 0 {
 			// members list was updated
 			continue

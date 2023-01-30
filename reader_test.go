@@ -17,6 +17,7 @@
 package websocket
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -73,19 +74,19 @@ func TestReceiveBinary(t *testing.T) {
 	}
 
 	// send one byte
-	err = client.SendFrame(Binary, []byte{1})
+	err = client.SendFrame(Binary, []byte{1}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// too long message
-	err = client.SendFrame(Binary, []byte{4, 4, 4, 4})
+	err = client.SendFrame(Binary, []byte{4, 4, 4, 4}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// send two bytes
-	err = client.SendFrame(Binary, []byte{5, 5})
+	err = client.SendFrame(Binary, []byte{5, 5}, true)
 	if err != nil {
 		t.Error(err)
 	}
@@ -139,7 +140,7 @@ func TestReceiveEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.SendFrame(Binary, []byte{}) // send empty binary message
+	err = client.SendFrame(Binary, []byte{}, true) // send empty binary message
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +160,96 @@ func TestReceiveEmpty(t *testing.T) {
 
 	for msg := range errorsInServer {
 		t.Error(msg)
+	}
+}
+
+// TestReceivePartial tests the case where a close frame is received
+// in the middle of a message.
+func TestReceivePartial(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	errorsInServer := make(chan string, 10)
+	handler := func(conn *Conn) {
+		// server code
+
+		buf := make([]byte, 16)
+
+		tp, r, err := conn.ReceiveMessage()
+		if err != nil {
+			errorsInServer <- "ReceiveMessage: " + err.Error()
+		} else if tp != Binary {
+			errorsInServer <- fmt.Sprintf("ReceiveMessage: wrong message type: %s", tp)
+		}
+
+		n, err := r.Read(buf)
+		if err != nil {
+			errorsInServer <- "Read: " + err.Error()
+		} else if !bytes.Equal(buf[:n], []byte{1, 2}) {
+			errorsInServer <- fmt.Sprintf("Read: wrong data %v", buf[:n])
+		}
+
+		n, err = r.Read(buf)
+		if err == nil {
+			errorsInServer <- fmt.Sprintf("Read: expected error, got %d bytes", n)
+		} else if err != ErrConnClosed {
+			errorsInServer <- "Read: unexpected error" + err.Error()
+		}
+		if n != 0 {
+			errorsInServer <- fmt.Sprintf("Read: wrong length %d", n)
+		}
+
+		err = conn.Close(StatusOK, "OK")
+		if err != nil {
+			errorsInServer <- "Close: " + err.Error()
+		}
+
+		close(errorsInServer)
+	}
+
+	server, err := StartTestServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	// fake client
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// send first part of the message
+	err = client.SendFrame(Binary, []byte{1, 2}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.SendFrame(closeFrame, []byte{1000 / 256, 1000 % 256}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// send the second part of the message
+	err = client.SendFrame(Binary, []byte{3, 4}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tp, _, err := client.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tp != closeFrame {
+		t.Errorf("expected close frame, got %s", tp)
+	}
+
+	err = client.Close()
+	if err != nil {
+		t.Error(err)
+	}
+
+	for err := range errorsInServer {
+		t.Error("server: " + err)
 	}
 }
 
@@ -197,7 +288,7 @@ func TestReceiveWrongType(t *testing.T) {
 	defer client.Close()
 
 	// send a text frame
-	err = client.SendFrame(Text, []byte{65})
+	err = client.SendFrame(Text, []byte{65}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

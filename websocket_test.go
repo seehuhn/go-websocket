@@ -185,10 +185,10 @@ func (client *TestClient) MakeHeader(buf []byte, op MessageType, l uint64, final
 	return headerLength
 }
 
-func (client *TestClient) SendFrame(op MessageType, body []byte) error {
+func (client *TestClient) SendFrame(op MessageType, body []byte, final bool) error {
 	l := len(body)
 	buf := make([]byte, l+14)
-	headerLength := client.MakeHeader(buf, op, uint64(l), true)
+	headerLength := client.MakeHeader(buf, op, uint64(l), final)
 	n := copy(buf[headerLength:], body)
 	_, err := client.conn.Write(buf[:headerLength+n])
 	return err
@@ -384,7 +384,7 @@ func TestClientToServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = client.SendFrame(Text, []byte(testMsg))
+	err = client.SendFrame(Text, []byte(testMsg), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,8 +401,9 @@ func TestClientToServer(t *testing.T) {
 
 func TestClientStatusCode(t *testing.T) {
 	type res struct {
-		status  Status
-		message string
+		connInfo ConnInfo
+		status   Status
+		message  string
 	}
 	c := make(chan *res, 1)
 
@@ -410,12 +411,12 @@ func TestClientStatusCode(t *testing.T) {
 	handler := func(conn *Conn) {
 		_, err := conn.ReceiveText(128)
 		if err == ErrConnClosed {
-			status, message := conn.GetStatus()
-			c <- &res{status, message}
+			connInfo, status, message := conn.Wait()
+			c <- &res{connInfo, status, message}
 		} else {
 			conn.Close(StatusProtocolError, "")
 			t.Error("expected ErrConnClosed, got", err)
-			c <- &res{9999, err.Error()}
+			c <- &res{ConnDropped, 9999, err.Error()}
 		}
 	}
 
@@ -456,7 +457,7 @@ func TestClientStatusCode(t *testing.T) {
 				body = append(body, byte(test.sentCode>>8), byte(test.sentCode))
 				body = append(body, []byte(test.sentMessage)...)
 			}
-			err = client.SendFrame(closeFrame, body)
+			err = client.SendFrame(closeFrame, body, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -489,14 +490,15 @@ func TestClientStatusCode(t *testing.T) {
 
 func TestServerStatusCode(t *testing.T) {
 	type res struct {
-		status  Status
-		message string
+		connInfo ConnInfo
+		status   Status
+		message  string
 	}
 	c := make(chan *res, 1)
 	handler := func(conn *Conn) {
 		conn.Close(StatusOK, "penguin")
-		status, message := conn.GetStatus()
-		c <- &res{status, message}
+		connInfo, status, message := conn.Wait()
+		c <- &res{connInfo, status, message}
 	}
 
 	server, err := StartTestServer(handler)
@@ -520,7 +522,7 @@ func TestServerStatusCode(t *testing.T) {
 		t.Error("client received wrong status code/message")
 	}
 
-	err = client.SendFrame(closeFrame, resp)
+	err = client.SendFrame(closeFrame, resp, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -590,6 +592,10 @@ func TestKeepConn(t *testing.T) {
 }
 
 func TestEchoMany(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
 	server, err := StartTestServer(echo)
 	if err != nil {
 		t.Fatal(err)
