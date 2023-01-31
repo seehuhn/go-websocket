@@ -88,14 +88,14 @@ func (conn *Conn) readManager(data *readManagerData) {
 		case 0:
 			clientStatus = StatusNotSent
 		case 1:
-			rb.failConnection()
+			rb.failConnection(ProtocolViolation)
 		default:
 			s := 256*Status(body[0]) + Status(body[1])
 			if s.clientCanSend() && utf8.Valid(body[2:]) {
 				clientStatus = s
 				clientMessage = string(body[2:])
 			} else {
-				rb.failConnection()
+				rb.failConnection(ProtocolViolation)
 			}
 		}
 	}
@@ -148,9 +148,9 @@ func (rb *receiver) refill(isCont bool) error {
 		err := rb.readFrameHeader()
 		if err != nil {
 			if err == errFrameFormat {
-				rb.connInfo = ProtocolViolation
+				rb.failConnection(ProtocolViolation)
 			} else {
-				rb.connInfo = ConnDropped
+				rb.failConnection(ConnDropped)
 			}
 			return err
 		}
@@ -159,12 +159,12 @@ func (rb *receiver) refill(isCont bool) error {
 			if rb.header.Length > 125 {
 				// All control frames MUST have a payload length of 125 bytes or less
 				// and MUST NOT be fragmented.
-				rb.connInfo = ProtocolViolation
+				rb.failConnection(ProtocolViolation)
 				return ErrConnClosed
 			}
 			_, err = io.ReadFull(rb.r, rb.scratch[:rb.header.Length])
 			if err != nil {
-				rb.connInfo = ConnDropped
+				rb.failConnection(ConnDropped)
 				return err
 			}
 			rb.unmask(rb.scratch[:rb.header.Length])
@@ -173,14 +173,14 @@ func (rb *receiver) refill(isCont bool) error {
 		switch rb.header.Opcode {
 		case Text, Binary:
 			if isCont {
-				rb.connInfo = ProtocolViolation
+				rb.failConnection(ProtocolViolation)
 				return ErrConnClosed
 			}
 			return nil
 
 		case contFrame:
 			if !isCont {
-				rb.connInfo = ProtocolViolation
+				rb.failConnection(ProtocolViolation)
 				return ErrConnClosed
 			}
 			return nil
@@ -215,7 +215,7 @@ func (rb *receiver) refill(isCont bool) error {
 			// we don't send ping frames and we ignore pong frames
 
 		default:
-			rb.connInfo = ProtocolViolation
+			rb.failConnection(ProtocolViolation)
 			return ErrConnClosed
 		}
 	}
@@ -293,8 +293,15 @@ func (rb *receiver) unmask(buf []byte) {
 	}
 }
 
-func (rb *receiver) failConnection() {
-	rb.connInfo = ProtocolViolation
+func (rb *receiver) failConnection(reason ConnInfo) {
+	if rb.shutdownStarted != nil {
+		// prevent further writes
+		close(rb.shutdownStarted)
+		rb.shutdownStarted = nil
+	}
+
+	// terminate the reader
+	rb.connInfo = reason
 }
 
 type frameReader struct {
@@ -319,7 +326,7 @@ func (fr *frameReader) Read(buf []byte) (int, error) {
 	n, err := rb.r.Read(buf[:amount])
 	rb.unmask(buf[:n])
 	if err != nil {
-		rb.connInfo = ConnDropped
+		rb.failConnection(ConnDropped)
 		return n, err
 	}
 
@@ -330,6 +337,9 @@ func (fr *frameReader) Read(buf []byte) (int, error) {
 	return n, err
 }
 
+// ReadAll read a complete message from the frameReader into buf.  If the
+// message is too long, ReadAll returns ErrTooLarge and discards the rest of
+// the message.
 func (fr *frameReader) ReadAll(buf []byte) (int, error) {
 	n := 0
 	for n < len(buf) {
@@ -403,15 +413,15 @@ func (conn *Conn) ReceiveMessage() (MessageType, io.Reader, error) {
 //
 // If more than 65535 clients are given, the function panics.
 func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, io.Reader, error) {
-	idx, b, err := selectChannel(ctx, clients)
+	idx, rb, err := selectChannel(ctx, clients)
 	if err != nil {
 		return -1, 0, nil, err
 	}
 
-	fr := &frameReader{rb: b, fromUser: clients[idx].fromUser}
+	fr := &frameReader{rb: rb, fromUser: clients[idx].fromUser}
 	ac := &autoCloseReader{fr: fr}
 
-	return idx, b.header.Opcode, ac, nil
+	return idx, rb.header.Opcode, ac, nil
 }
 
 // ReceiveBinary reads a binary message from the connection.  If the message
@@ -440,26 +450,26 @@ func (conn *Conn) ReceiveBinary(buf []byte) (int, error) {
 // If the context expires or is cancelled, the error is either
 // context.DeadlineExceeded or context.Cancelled.
 func SelectBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int, err error) {
-	idx, b, err := selectChannel(ctx, clients)
+	idx, rb, err := selectChannel(ctx, clients)
 	if err != nil {
 		return -1, 0, err
 	}
-	n, err = clients[idx].doReceiveBinary(buf, b)
+	n, err = clients[idx].doReceiveBinary(buf, rb)
 	return idx, n, err
 }
 
-func (conn *Conn) doReceiveBinary(buf []byte, b *receiver) (int, error) {
-	defer func() { conn.fromUser <- b }()
+func (conn *Conn) doReceiveBinary(buf []byte, rb *receiver) (int, error) {
+	defer func() { conn.fromUser <- rb }()
 
-	if b.header.Opcode != Binary {
-		b.connInfo = WrongMessageType
+	if rb.header.Opcode != Binary {
+		rb.failConnection(WrongMessageType)
 		return 0, ErrConnClosed
 	}
 
-	r := &frameReader{rb: b, fromUser: conn.fromUser}
+	r := &frameReader{rb: rb, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
-		b.connInfo = ConnDropped
+		rb.failConnection(ConnDropped)
 	}
 	return n, err
 }
@@ -489,31 +499,30 @@ func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 // If the context expires or is cancelled, the error is either
 // context.DeadlineExceeded or context.Cancelled.
 func SelectText(ctx context.Context, maxLength int, clients []*Conn) (idx int, text string, err error) {
-	idx, b, err := selectChannel(ctx, clients)
+	idx, rb, err := selectChannel(ctx, clients)
 	if err != nil {
 		return -1, "", err
 	}
-	text, err = clients[idx].doReceiveText(maxLength, b)
+	text, err = clients[idx].doReceiveText(maxLength, rb)
 	return idx, text, err
 }
 
-func (conn *Conn) doReceiveText(maxLength int, b *receiver) (string, error) {
-	defer func() { conn.fromUser <- b }()
+func (conn *Conn) doReceiveText(maxLength int, rb *receiver) (string, error) {
+	defer func() { conn.fromUser <- rb }()
 
-	if b.header.Opcode != Text {
-		b.connInfo = WrongMessageType
+	if rb.header.Opcode != Text {
+		rb.failConnection(WrongMessageType)
 		return "", ErrConnClosed
 	}
 
-	if b.header.Final && b.header.Length <= int64(maxLength) {
-		maxLength = int(b.header.Length)
+	if rb.header.Final && rb.header.Length <= int64(maxLength) {
+		maxLength = int(rb.header.Length)
 	}
 	buf := make([]byte, maxLength)
 
-	r := &frameReader{rb: b, fromUser: conn.fromUser}
+	r := &frameReader{rb: rb, fromUser: conn.fromUser}
 	n, err := r.ReadAll(buf)
 	if err != nil && err != ErrTooLarge {
-		b.connInfo = ConnDropped
 		return "", err
 	}
 
@@ -528,7 +537,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *receiver) (string, error) {
 				break
 			}
 
-			b.connInfo = ProtocolViolation
+			rb.connInfo = ProtocolViolation
 			return "", ErrConnClosed
 		}
 		idx += size

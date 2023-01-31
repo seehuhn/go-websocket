@@ -17,6 +17,7 @@
 package websocket
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"net/url"
@@ -53,6 +54,46 @@ type Conn struct {
 	clientMessage string
 }
 
+func (conn *Conn) initialize(raw net.Conn, rw *bufio.ReadWriter) {
+	// fill in the remaining fields of the Conn object
+	conn.raw = raw
+
+	shutdownStarted := make(chan struct{})
+	shutdownComplete := make(chan struct{})
+	conn.shutdownComplete = shutdownComplete
+
+	wb := &sender{
+		w:      rw.Writer,
+		header: [10]byte{},
+
+		shutdownStarted: shutdownStarted,
+	}
+	conn.senderStore = make(chan *sender, 1)
+	conn.senderStore <- wb
+
+	rb := &receiver{
+		r:           rw.Reader,
+		senderStore: conn.senderStore,
+		scratch:     make([]byte, 128),
+
+		shutdownStarted: shutdownStarted,
+	}
+	fromUser := make(chan *receiver, 1)
+	fromUser <- rb
+	toUser := make(chan *receiver, 1)
+	conn.fromUser = fromUser
+	conn.toUser = toUser
+
+	// Start the read multiplexer goroutine.  This goroutine will
+	// manages the connection and closes the TCP connection when
+	// the websocket connection is closed.
+	go conn.readManager(&readManagerData{
+		fromUser:         fromUser,
+		toUser:           toUser,
+		shutdownComplete: shutdownComplete,
+	})
+}
+
 // Close terminates a websocket connection and frees all associated resources.
 // The connection cannot be used any more after Close() has been called.
 //
@@ -74,14 +115,18 @@ func (conn *Conn) Close(code Status, message string) error {
 	}
 
 	wb := <-conn.senderStore
-	if wb != nil {
-		close(conn.senderStore) // prevent further writes
-
-		err := wb.sendCloseFrame(code, body)
-		if err != nil {
-			conn.raw.Close()
-			return ErrConnClosed
+	if wb == nil || wb.isShuttingDown() {
+		if wb != nil {
+			conn.senderStore <- wb
 		}
+		return ErrConnClosed
+	}
+
+	close(conn.senderStore) // prevent further writes
+	err := wb.sendCloseFrame(code, body)
+	if err != nil {
+		conn.raw.Close()
+		return ErrConnClosed
 	}
 
 	// Give the client 3 seconds to close the connection, before closing it

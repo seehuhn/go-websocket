@@ -53,11 +53,6 @@ func TestReceiveBinary(t *testing.T) {
 			errorsInServer <- fmt.Sprintf("not properly closed: buf=[% x], err=%s", buf[:n], err)
 		}
 
-		err = conn.Close(StatusOK, "OK")
-		if err != nil {
-			errorsInServer <- err.Error()
-		}
-
 		close(errorsInServer)
 	}
 
@@ -264,11 +259,6 @@ func TestReceiveWrongType(t *testing.T) {
 		n, err := conn.ReceiveBinary(buf)
 		if err != ErrConnClosed || n != 0 {
 			errorsInServer <- fmt.Sprintf("wrong type: buf=[% x], err=%s", buf[:n], err)
-		}
-
-		err = conn.Close(StatusOK, "OK")
-		if err != nil {
-			errorsInServer <- err.Error()
 		}
 
 		close(errorsInServer)
