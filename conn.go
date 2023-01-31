@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"time"
 )
 
 // Conn represents a websocket connection initiated by a client.  All fields
@@ -38,18 +39,66 @@ type Conn struct {
 	raw net.Conn
 
 	senderStore chan *sender
+	toUser      <-chan *receiver
+	fromUser    chan<- *receiver
 
 	// ReaderDone is closed when the reader goroutine has finished.
 	// After this point, the reader will not access the Conn object
 	// any more and will not send any more control messages.
-	readerDone <-chan struct{}
-	toUser     <-chan *reader
-	fromUser   chan<- *reader
+	shutdownComplete <-chan struct{}
 
-	// the following fields can only be read once readerDone is closed
+	// the following fields can only be read once shutdownComplete is closed
 	connInfo      ConnInfo
 	clientStatus  Status
 	clientMessage string
+}
+
+// Close terminates a websocket connection and frees all associated resources.
+// The connection cannot be used any more after Close() has been called.
+//
+// The status code indicates whether the connection completed successfully, or
+// due to an error.  Use StatusOK for normal termination, and one of the other
+// status codes in case of errors. Use StatusNotSent to not send a status code.
+//
+// The message can be used to provide additional information to the client for
+// debugging.  The utf-8 representation of the string can be at most 123 bytes
+// long, otherwise ErrTooLarge is returned.
+func (conn *Conn) Close(code Status, message string) error {
+	if !(code.serverCanSend() || code == StatusNotSent) {
+		return ErrStatusCode
+	}
+
+	body := []byte(message)
+	if len(body) > 125-2 {
+		return ErrTooLarge
+	}
+
+	wb := <-conn.senderStore
+	if wb != nil {
+		close(conn.senderStore) // prevent further writes
+
+		err := wb.sendCloseFrame(code, body)
+		if err != nil {
+			conn.raw.Close()
+			return ErrConnClosed
+		}
+	}
+
+	// Give the client 3 seconds to close the connection, before closing it
+	// from our end.
+	go func() {
+		timeOut := time.NewTimer(3 * time.Second)
+		select {
+		case <-conn.shutdownComplete:
+			if !timeOut.Stop() {
+				<-timeOut.C
+			}
+		case <-timeOut.C:
+			conn.raw.Close() // force-stop the reader
+		}
+	}()
+
+	return nil
 }
 
 // ConnInfo describes why a websocket connection was closed.
@@ -70,7 +119,7 @@ const (
 	ProtocolViolation
 
 	// WrongMessageType indicates that we closed the connection because
-	// the client sent a message of the wrong type.
+	// the client sent a message of the wrong type (Text vs. Binary).
 	WrongMessageType
 
 	// ConnDropped indicates that the underlying TCP connection was
@@ -177,7 +226,7 @@ var knownValidCode = map[Status]bool{
 // included, the status code will be StatusNotSent.  Otherwise, the status code
 // is the status code sent by the client.
 func (conn *Conn) Wait() (ConnInfo, Status, string) {
-	<-conn.readerDone
+	<-conn.shutdownComplete
 	return conn.connInfo, conn.clientStatus, conn.clientMessage
 }
 

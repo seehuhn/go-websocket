@@ -24,29 +24,45 @@ import (
 	"unicode/utf8"
 )
 
-type reader struct {
+// Receiver is used as a semaphore to control read access to the underlying
+// TCP connection.  There is only one receiver object per connection.
+// Users wanting to read from the connection can obtain the receiver
+// via the Conn.toUser channel.  Once the user has finished reading,
+// it must return the receiver to the Conn.fromUser channel.
+type receiver struct {
 	r           *bufio.Reader
-	senderStore chan *sender // only used for pong frames
-	scratch     []byte       // buffer for headers and control frame payloads
+	senderStore chan *sender
+	scratch     []byte // buffer for headers and control frame payloads
 	header      frameHeader
 	pos         int64
-	connInfo    ConnInfo
+
+	connInfo        ConnInfo
+	shutdownStarted chan<- struct{}
 }
 
-type readMultiplexerData struct {
-	fromUser   <-chan *reader
-	toUser     chan<- *reader
-	readerDone chan<- struct{}
+type readManagerData struct {
+	fromUser         <-chan *receiver
+	toUser           chan<- *receiver
+	shutdownComplete chan<- struct{}
 }
 
-// ReadMultiplexer reads all data from the network connection.
-// Control frames are handled internally by this function,
-// data frames are read on behalf of the user.
-func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
-	var rb *reader
+func (conn *Conn) readManager(data *readManagerData) {
+	// The following loop keeps listening on the connection while no user
+	// is reading from the connection.  Once the loop terminates, the
+	// connection will be closed.
+	//
+	// There are three ways to terminate the loop:
+	//   1. A close frame was received from the client.
+	//      In this case, rb.header.Opcode == closeFrame, and the
+	//      close frame payload is stored in rb.scratch.
+	//   2. A read error occurs while reading from the connection.
+	//      In this case, rb.connInfo is set to ConnDropped.
+	//   3. We fail the connection.  In this case, rb.connInfo is set
+	//      to either [ProtocolViolation] or [WrongMessageType].
+	var rb *receiver
 	for {
 		rb = <-data.fromUser
-		if rb.connInfo != 0 {
+		if rb.connInfo != 0 || rb.header.Opcode == closeFrame {
 			break
 		}
 
@@ -63,43 +79,38 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 	// Notify the user that no more data will be incoming.
 	close(data.toUser)
 
-	// reason == 0, close
-	// reason != 0, close
-	// reason != 0, other
-
 	// Determine the client status code and message.
-	connInfo := rb.connInfo
 	clientStatus := StatusDropped
 	var clientMessage string
-	if connInfo == 0 && rb.header.Opcode == closeFrame {
+	if rb.header.Opcode == closeFrame {
 		body := rb.scratch[:rb.header.Length]
 		switch len(body) {
 		case 0:
 			clientStatus = StatusNotSent
 		case 1:
-			connInfo = ProtocolViolation
+			rb.failConnection()
 		default:
-			tmp := 256*Status(body[0]) + Status(body[1])
-			if tmp.clientCanSend() && utf8.Valid(body[2:]) {
-				clientStatus = tmp
+			s := 256*Status(body[0]) + Status(body[1])
+			if s.clientCanSend() && utf8.Valid(body[2:]) {
+				clientStatus = s
 				clientMessage = string(body[2:])
 			} else {
-				connInfo = ProtocolViolation
+				rb.failConnection()
 			}
 		}
 	}
 
 	wb := <-conn.senderStore
 	if wb != nil {
-		// We haven't sent a close frame yet, so we can send one now.
+		// We haven't sent a close frame yet, so we send one now.
 
 		// no more frames are sent after the close frame
 		close(conn.senderStore)
 
 		var closeStatus Status
-		if connInfo == 0 {
+		if rb.connInfo == 0 {
 			closeStatus = clientStatus
-		} else if connInfo == WrongMessageType {
+		} else if rb.connInfo == WrongMessageType {
 			closeStatus = StatusUnsupportedType
 		} else {
 			closeStatus = StatusProtocolError
@@ -108,11 +119,11 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 		// TODO(voss): what to do in case of send errors?
 		wb.sendCloseFrame(closeStatus, nil)
 
-		if connInfo == 0 {
-			connInfo = ClientClosed
+		if rb.connInfo == 0 {
+			rb.connInfo = ClientClosed
 		}
-	} else if connInfo == 0 {
-		connInfo = ServerClosed
+	} else if rb.connInfo == 0 {
+		rb.connInfo = ServerClosed
 	}
 
 	// Close the TCP connection.
@@ -120,16 +131,16 @@ func (conn *Conn) readMultiplexer(data *readMultiplexerData) {
 	// errors here, this is not a problem.
 	conn.raw.Close()
 
-	conn.connInfo = connInfo
+	conn.connInfo = rb.connInfo
 	conn.clientStatus = clientStatus
 	conn.clientMessage = clientMessage
-	close(data.readerDone)
+	close(data.shutdownComplete)
 }
 
 // Refill reads data from the connection until a data frame is available.
 // Control frames are processed as they are encountered.
 // If an error is returned, rb.connInfo is set to the appropriate value.
-func (rb *reader) refill(isCont bool) error {
+func (rb *receiver) refill(isCont bool) error {
 	if rb.header.Opcode == closeFrame {
 		return ErrConnClosed
 	}
@@ -210,12 +221,12 @@ func (rb *reader) refill(isCont bool) error {
 	}
 }
 
-func (b *reader) readFrameHeader() error {
-	b0, err := b.r.ReadByte()
+func (rb *receiver) readFrameHeader() error {
+	b0, err := rb.r.ReadByte()
 	if err != nil {
 		return err
 	}
-	b1, err := b.r.ReadByte()
+	b1, err := rb.r.ReadByte()
 	if err != nil {
 		return err
 	}
@@ -241,16 +252,16 @@ func (b *reader) readFrameHeader() error {
 		lengthBytes = 2
 	}
 	if lengthBytes > 1 {
-		n, _ := io.ReadFull(b.r, b.scratch[:lengthBytes])
+		n, _ := io.ReadFull(rb.r, rb.scratch[:lengthBytes])
 		if n < lengthBytes {
 			return errFrameFormat
 		}
 	} else {
-		b.scratch[0] = l8
+		rb.scratch[0] = l8
 	}
 	var length uint64
 	for i := 0; i < lengthBytes; i++ {
-		length = length<<8 | uint64(b.scratch[i])
+		length = length<<8 | uint64(rb.scratch[i])
 	}
 	if length&(1<<63) != 0 {
 		return errFrameFormat
@@ -260,31 +271,35 @@ func (b *reader) readFrameHeader() error {
 		return errFrameFormat
 	}
 
-	b.header.Final = final != 0
-	b.header.Opcode = MessageType(opcode)
-	b.header.Length = int64(length)
+	rb.header.Final = final != 0
+	rb.header.Opcode = MessageType(opcode)
+	rb.header.Length = int64(length)
 
 	// read the masking key
-	_, err = io.ReadFull(b.r, b.header.Mask[:])
+	_, err = io.ReadFull(rb.r, rb.header.Mask[:])
 	if err != nil {
 		return err
 	}
 
-	b.pos = 0
+	rb.pos = 0
 
 	return nil
 }
 
-func (b *reader) unmask(buf []byte) {
+func (rb *receiver) unmask(buf []byte) {
 	for i := range buf {
-		buf[i] ^= b.header.Mask[b.pos&3]
-		b.pos++
+		buf[i] ^= rb.header.Mask[rb.pos&3]
+		rb.pos++
 	}
 }
 
+func (rb *receiver) failConnection() {
+	rb.connInfo = ProtocolViolation
+}
+
 type frameReader struct {
-	rb       *reader
-	fromUser chan<- *reader
+	rb       *receiver
+	fromUser chan<- *receiver
 }
 
 func (fr *frameReader) Read(buf []byte) (int, error) {
@@ -433,7 +448,7 @@ func SelectBinary(ctx context.Context, buf []byte, clients []*Conn) (idx, n int,
 	return idx, n, err
 }
 
-func (conn *Conn) doReceiveBinary(buf []byte, b *reader) (int, error) {
+func (conn *Conn) doReceiveBinary(buf []byte, b *receiver) (int, error) {
 	defer func() { conn.fromUser <- b }()
 
 	if b.header.Opcode != Binary {
@@ -482,7 +497,7 @@ func SelectText(ctx context.Context, maxLength int, clients []*Conn) (idx int, t
 	return idx, text, err
 }
 
-func (conn *Conn) doReceiveText(maxLength int, b *reader) (string, error) {
+func (conn *Conn) doReceiveText(maxLength int, b *receiver) (string, error) {
 	defer func() { conn.fromUser <- b }()
 
 	if b.header.Opcode != Text {
@@ -522,7 +537,7 @@ func (conn *Conn) doReceiveText(maxLength int, b *reader) (string, error) {
 	return string(buf[:n]), err
 }
 
-func selectChannel(ctx context.Context, clients []*Conn) (int, *reader, error) {
+func selectChannel(ctx context.Context, clients []*Conn) (int, *receiver, error) {
 	numClients := len(clients)
 	if numClients > 65535 {
 		// select supports at most 65536 cases, and we need one for the context
@@ -557,11 +572,11 @@ func selectChannel(ctx context.Context, clients []*Conn) (int, *reader, error) {
 			if numClosed == numClients {
 				return -1, nil, ErrConnClosed
 			}
-			cases[idx].Chan = reflect.ValueOf((<-chan *reader)(nil))
+			cases[idx].Chan = reflect.ValueOf((<-chan *receiver)(nil))
 			continue
 		}
 
-		rb := recv.Interface().(*reader)
+		rb := recv.Interface().(*receiver)
 		return idx, rb, nil
 	}
 }

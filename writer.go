@@ -21,7 +21,6 @@ import (
 	"context"
 	"io"
 	"reflect"
-	"time"
 )
 
 const maxHeaderSize = 10
@@ -29,6 +28,18 @@ const maxHeaderSize = 10
 type sender struct {
 	w      *bufio.Writer
 	header [maxHeaderSize]byte
+
+	// ShutdownStarted is closed when we have started to shut down the connection.
+	shutdownStarted <-chan struct{}
+}
+
+func (wb *sender) isShuttingDown() bool {
+	select {
+	case <-wb.shutdownStarted:
+		return true
+	default:
+		return false
+	}
 }
 
 func (wb *sender) sendFrame(opcode MessageType, body []byte, final bool) error {
@@ -94,6 +105,10 @@ type frameWriter struct {
 }
 
 func (w *frameWriter) Write(p []byte) (int, error) {
+	if w.isShuttingDown() {
+		return 0, ErrConnClosed
+	}
+
 	err := w.sendFrame(w.tp, p, false)
 	if err != nil {
 		return 0, err
@@ -103,64 +118,17 @@ func (w *frameWriter) Write(p []byte) (int, error) {
 }
 
 func (w *frameWriter) Close() error {
-	// send the final frame
-	err := w.sendFrame(w.tp, nil, true)
-	if err != nil {
-		return err
+	var err error
+
+	if !w.isShuttingDown() {
+		// send the final frame
+		err = w.sendFrame(w.tp, nil, true)
 	}
 
 	wb := w.sender
 	w.sender = nil
 	w.store <- wb
-	return nil
-}
-
-// Close terminates a websocket connection and frees all associated resources.
-// The connection cannot be used any more after Close() has been called.
-//
-// The status code indicates whether the connection completed successfully, or
-// due to an error.  Use StatusOK for normal termination, and one of the other
-// status codes in case of errors. Use StatusNotSent to not send a status code.
-//
-// The message can be used to provide additional information to the client for
-// debugging.  The utf-8 representation of the string can be at most 123 bytes
-// long, otherwise ErrTooLarge is returned.
-func (conn *Conn) Close(code Status, message string) error {
-	if !(code.serverCanSend() || code == StatusNotSent) {
-		return ErrStatusCode
-	}
-
-	body := []byte(message)
-	if len(body) > 125-2 {
-		return ErrTooLarge
-	}
-
-	wb := <-conn.senderStore
-	if wb != nil {
-		close(conn.senderStore) // prevent further writes
-
-		err := wb.sendCloseFrame(code, body)
-		if err != nil {
-			conn.raw.Close()
-			return ErrConnClosed
-		}
-	}
-
-	// Give the client 3 seconds to close the connection, before closing it
-	// from our end.
-	go func() {
-		timeOut := time.NewTimer(3 * time.Second)
-		select {
-		case <-conn.readerDone:
-			if !timeOut.Stop() {
-				<-timeOut.C
-			}
-		case <-timeOut.C:
-			conn.raw.Close() // force-stop the reader
-		}
-	}()
-
-	return nil
+	return err
 }
 
 // SendMessage starts a new message and returns an io.WriteCloser
@@ -172,6 +140,8 @@ func (conn *Conn) SendMessage(tp MessageType) (io.WriteCloser, error) {
 	if wb == nil {
 		return nil, ErrConnClosed
 	}
+	// The sender is returned to the conn.senderStore in the
+	// frameWriter.Close() method.
 
 	w := &frameWriter{
 		sender: wb,
@@ -190,14 +160,15 @@ func (conn *Conn) SendBinary(msg []byte) error {
 		return ErrConnClosed
 	}
 
-	err := wb.sendFrame(Binary, msg, true)
-	if err != nil {
-		return err
+	var err error
+	if !wb.isShuttingDown() {
+		err = wb.sendFrame(Binary, msg, true)
+	} else {
+		err = ErrConnClosed
 	}
 
 	conn.senderStore <- wb
-
-	return nil
+	return err
 }
 
 // SendText sends a text message to the client.
@@ -207,14 +178,15 @@ func (conn *Conn) SendText(msg string) error {
 		return ErrConnClosed
 	}
 
-	err := wb.sendFrame(Text, []byte(msg), true)
-	if err != nil {
-		return err
+	var err error
+	if !wb.isShuttingDown() {
+		err = wb.sendFrame(Text, []byte(msg), true)
+	} else {
+		err = ErrConnClosed
 	}
 
 	conn.senderStore <- wb
-
-	return nil
+	return err
 }
 
 // BroadcastBinary sends a binary message to all clients in the
@@ -261,8 +233,7 @@ mainLoop:
 	for todo > 0 {
 		idx, recv, recvOK := reflect.Select(cases)
 
-		if idx == numClients {
-			// the context was cancelled
+		if idx == numClients { // the context was cancelled
 			err := ctx.Err()
 			for i := 0; i < numClients; i++ {
 				if cases[i].Chan != disabled {
@@ -274,8 +245,7 @@ mainLoop:
 
 		cases[idx].Chan = disabled
 
-		if !recvOK {
-			// the connection was closed
+		if !recvOK { // the connection was closed
 			errors[idx] = ErrConnClosed
 			todo--
 			continue mainLoop
@@ -283,11 +253,11 @@ mainLoop:
 
 		wb := recv.Interface().(*sender)
 		err := wb.sendFrame(tp, msg, true)
+		clients[idx].senderStore <- wb
 		if err != nil {
 			errors[idx] = err
 			continue mainLoop
 		}
-		clients[idx].senderStore <- wb
 	}
 	return errors
 }

@@ -311,6 +311,86 @@ func TestReceiveWrongType(t *testing.T) {
 	}
 }
 
+// TestInvalidCont tests the case where a continuation frame does not
+// have the correct opcode set.
+func TestInvalidCont(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	errorsInServer := make(chan string, 10)
+	handler := func(conn *Conn) {
+		// server code
+		s, err := conn.ReceiveText(128)
+		if err != nil || s != "firstsecond" {
+			errorsInServer <- fmt.Sprintf("ReceiveText: %q, %s", s, err)
+		}
+
+		s, err = conn.ReceiveText(128)
+		if err != ErrConnClosed || s != "" {
+			errorsInServer <- fmt.Sprintf("ReceiveText: %q, %s", s, err)
+		}
+
+		err = conn.Close(StatusOK, "OK")
+		if err != ErrConnClosed {
+			errorsInServer <- fmt.Sprintf("Close: %s", err)
+		}
+
+		close(errorsInServer)
+	}
+
+	server, err := StartTestServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	// fake client
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// send a good text message
+	err = client.SendFrame(Text, []byte("first"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.SendFrame(contFrame, []byte("second"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// send an invalid text message
+	err = client.SendFrame(Text, []byte("first"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.SendFrame(Text, []byte("second"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tp, msg, err := client.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tp != closeFrame {
+		t.Errorf("expected close frame, got %s", tp)
+	}
+	if !bytes.Equal(msg, []byte{1002 / 256, 1002 % 256}) {
+		t.Errorf("expected close code 1002, got %d", 256*Status(msg[0])+Status(msg[1]))
+	}
+
+	err = client.Close()
+	if err != nil {
+		t.Error(err)
+	}
+
+	for err := range errorsInServer {
+		t.Error("server: " + err)
+	}
+}
+
 // TestTooLong tests that too long messages are correctly processed
 // on the server side.
 func TestTooLong(t *testing.T) {
