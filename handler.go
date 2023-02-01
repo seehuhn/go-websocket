@@ -80,6 +80,11 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 // Upgrade upgrades an HTTP connection to the websocket protocol.
 // After this function returns, `w` and `req` cannot be used any more.
+//
+// This does not call the Handle function, but only performs the
+// websocket handshake.  The returned connection object can be used
+// to send and receive messages on the connection, or handler.Handle
+// can be called manually on the connection object.
 func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn, error) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
