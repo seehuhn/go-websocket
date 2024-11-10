@@ -3,7 +3,6 @@ package websocket
 import (
 	"bufio"
 	"io"
-	"io/ioutil"
 	"net"
 	"sync"
 	"testing"
@@ -78,13 +77,13 @@ func FuzzReader(f *testing.F) {
 
 				w, err := conn.SendMessage(tp)
 				if err != nil {
-					io.Copy(ioutil.Discard, r)
+					io.Copy(io.Discard, r)
 					break
 				}
 
 				_, err = io.Copy(w, r)
 				if err != nil {
-					io.Copy(ioutil.Discard, r)
+					io.Copy(io.Discard, r)
 				}
 
 				w.Close()
@@ -95,7 +94,7 @@ func FuzzReader(f *testing.F) {
 
 		wg.Add(1)
 		go func() {
-			io.Copy(ioutil.Discard, client)
+			io.Copy(io.Discard, client)
 			wg.Done()
 		}()
 

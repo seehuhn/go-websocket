@@ -424,12 +424,13 @@ func ReceiveOneMessage(ctx context.Context, clients []*Conn) (int, MessageType, 
 	return idx, rb.header.Opcode, ac, nil
 }
 
-// ReceiveBinary reads a binary message from the connection.  If the message
-// received is not binary, the channel is closed with status
+// ReceiveBinary reads a binary message from the connection.  If the next
+// received message is not binary, the channel is closed with status
 // StatusProtocolError and [ErrConnClosed] is returned.
 //
 // If the received message is longer than buf, the buffer contains the start of
-// the message and [ErrTooLarge] is returned.
+// the message and [ErrTooLarge] is returned.  The rest of the message is
+// discarded, the connection stays functional.
 func (conn *Conn) ReceiveBinary(buf []byte) (int, error) {
 	b, ok := <-conn.toUser
 	if !ok {
@@ -475,10 +476,12 @@ func (conn *Conn) doReceiveBinary(buf []byte, rb *receiver) (int, error) {
 }
 
 // ReceiveText reads a text message from the connection.  If the next received
-// message is not a text message, , the channel is closed with status
-// StatusProtocolError and [ErrConnClosed] is returned.  If the length of the
-// utf-8 representation of the text exceeds maxLength bytes, the text is
-// truncated and ErrTooLarge is returned.
+// message is not a text message, the channel is closed with status
+// StatusProtocolError and [ErrConnClosed] is returned.
+//
+// If the length of the utf-8 representation of the text exceeds maxLength
+// bytes, the text is truncated and ErrTooLarge is returned. The rest of the
+// message is discarded, the connection stays functional.
 func (conn *Conn) ReceiveText(maxLength int) (string, error) {
 	b, ok := <-conn.toUser
 	if !ok {

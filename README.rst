@@ -55,13 +55,13 @@ connection::
 		  if err != nil {
 			  // We still need to read the complete message, so that the
 			  // next read doesn't block.
-			  io.Copy(ioutil.Discard, r)
+			  io.Copy(io.Discard, r)
 			  break
 		  }
 
 		  _, err = io.Copy(w, r)
 		  if err != nil {
-			  io.Copy(ioutil.Discard, r)
+			  io.Copy(io.Discard, r)
 		  }
 
 		  w.Close()

@@ -206,7 +206,7 @@ const (
 	StatusDropped Status = 1006 // never sent over the wire
 
 	// StatusInvalidData indicates that an endpoint is terminating the
-	// connection because it has received data within a message that was\
+	// connection because it has received data within a message that was
 	// not consistent with the type of the message (e.g., non-UTF-8 data
 	// within a text message).
 	StatusInvalidData Status = 1007

@@ -19,7 +19,6 @@ package main
 import (
 	"flag"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 
@@ -45,14 +44,14 @@ func echo(conn *websocket.Conn) {
 			log.Println("cannot create writer:", err)
 			// We need to read the complete message, so that the next
 			// read doesn't block.
-			io.Copy(ioutil.Discard, r)
+			io.Copy(io.Discard, r)
 			break
 		}
 
 		_, err = io.Copy(w, r)
 		if err != nil {
 			log.Println("write error:", err)
-			io.Copy(ioutil.Discard, r)
+			io.Copy(io.Discard, r)
 		}
 
 		err = w.Close()
