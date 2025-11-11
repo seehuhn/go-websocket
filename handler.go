@@ -101,7 +101,6 @@ func (handler *Handler) Upgrade(w http.ResponseWriter, req *http.Request) (*Conn
 	w.WriteHeader(status)
 	raw, rw, err := hijacker.Hijack()
 	if err != nil {
-		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return nil, err
 	}
 	raw.SetDeadline(time.Time{})
@@ -132,7 +131,7 @@ func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Co
 	}
 	query := origURI.RawQuery
 	if query != "" {
-		query = "&" + query
+		query = "?" + query
 	}
 	resourceName = path + query
 
