@@ -1,6 +1,6 @@
 module seehuhn.de/go/websocket
 
-go 1.16
+go 1.25
 
 retract (
 	v1.1.1 // Contains retractions only.

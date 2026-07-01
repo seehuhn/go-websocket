@@ -197,7 +197,7 @@ func BroadcastBinary(ctx context.Context, clients []*Conn, msg []byte) map[int]e
 	return doBroadcast(ctx, clients, Binary, msg)
 }
 
-// BroadcastBinary sends a text message to all clients in the
+// BroadcastText sends a text message to all clients in the
 // given slice.  The return value contains all errors that occurred
 // during sending.  The keys of the map are the indices of the
 // clients in the slice.
@@ -244,10 +244,10 @@ mainLoop:
 		}
 
 		cases[idx].Chan = disabled
+		todo--
 
 		if !recvOK { // the connection was closed
 			errors[idx] = ErrConnClosed
-			todo--
 			continue mainLoop
 		}
 

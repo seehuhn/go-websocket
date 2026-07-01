@@ -18,6 +18,7 @@ package websocket
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -26,7 +27,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
 var (
@@ -323,6 +327,133 @@ func (client *TestClient) BounceBinary(length uint64, buffer []byte,
 		sendErr = recvErr
 	}
 	return sendErr
+}
+
+// newPipeConn creates a minimal server-side Conn whose outgoing frames are
+// written to an in-memory net.Pipe, together with a TestClient reading the
+// other end.  It deliberately bypasses the HTTP handshake and the read
+// multiplexer goroutine so that the only blocking operations are on
+// in-memory channels.  That is what lets the broadcast run inside a
+// testing/synctest bubble: real socket or file I/O is not "durably blocked"
+// and would defeat the fake clock.
+func newPipeConn() (*Conn, *TestClient) {
+	serverEnd, clientEnd := net.Pipe()
+	wb := &sender{
+		w:               bufio.NewWriter(serverEnd),
+		shutdownStarted: make(chan struct{}),
+	}
+	conn := &Conn{
+		raw:         serverEnd,
+		senderStore: make(chan *sender, 1),
+	}
+	conn.senderStore <- wb
+	client := &TestClient{
+		conn:   clientEnd,
+		reader: bufio.NewReader(clientEnd),
+	}
+	return conn, client
+}
+
+// TestBroadcast checks that BroadcastText and BroadcastBinary send the
+// message to every client and, crucially, return promptly once all sends
+// have completed (rather than blocking until the context is cancelled).
+//
+// The whole test runs inside a testing/synctest bubble.  time.After below
+// therefore uses a fake clock that only advances once every other goroutine
+// is durably blocked, so the non-termination guard is deterministic and adds
+// no real wall-clock delay: with the bug present it fires immediately, and
+// with the bug fixed it never fires at all.
+func TestBroadcast(t *testing.T) {
+	const numClients = 3
+
+	cases := []struct {
+		name string
+		tp   MessageType
+		send func(ctx context.Context, conns []*Conn) map[int]error
+	}{
+		{
+			name: "text",
+			tp:   Text,
+			send: func(ctx context.Context, conns []*Conn) map[int]error {
+				return BroadcastText(ctx, conns, "hello")
+			},
+		},
+		{
+			name: "binary",
+			tp:   Binary,
+			send: func(ctx context.Context, conns []*Conn) map[int]error {
+				return BroadcastBinary(ctx, conns, []byte("hello"))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				conns := make([]*Conn, numClients)
+				clients := make([]*TestClient, numClients)
+				for i := range conns {
+					conns[i], clients[i] = newPipeConn()
+				}
+
+				// net.Pipe is synchronous: a write only completes once the
+				// far end is read.  Read each client's frame concurrently
+				// with the broadcast so the sends can make progress.
+				type frame struct {
+					tp  MessageType
+					msg []byte
+					err error
+				}
+				frames := make([]frame, numClients)
+				var wg sync.WaitGroup
+				wg.Add(numClients)
+				for i := range clients {
+					go func(i int) {
+						defer wg.Done()
+						tp, msg, err := clients[i].ReadFrame()
+						frames[i] = frame{tp, msg, err}
+					}(i)
+				}
+
+				// The broadcast runs with a context we only cancel on
+				// failure.  In the success path it must return on its own,
+				// so cancellation can never mask the non-termination bug;
+				// the deferred cancel merely lets a hung broadcast unwind
+				// cleanly once the test has already failed.
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				done := make(chan map[int]error, 1)
+				go func() {
+					done <- tc.send(ctx, conns)
+				}()
+
+				var errs map[int]error
+				select {
+				case errs = <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("broadcast did not return after sending to all clients")
+				}
+				if len(errs) != 0 {
+					t.Fatalf("unexpected broadcast errors: %v", errs)
+				}
+
+				// Every client should have received exactly the broadcast frame.
+				wg.Wait()
+				for i, f := range frames {
+					if f.err != nil {
+						t.Fatalf("client %d: %v", i, f.err)
+					}
+					if f.tp != tc.tp {
+						t.Errorf("client %d: wrong message type %v", i, f.tp)
+					}
+					if string(f.msg) != "hello" {
+						t.Errorf("client %d: wrong message %q", i, f.msg)
+					}
+				}
+			})
+		})
+	}
 }
 
 // TestServerToClient tries to send a single message from the server
