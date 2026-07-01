@@ -193,8 +193,11 @@ func TestReceivePartial(t *testing.T) {
 			errorsInServer <- fmt.Sprintf("Read: wrong length %d", n)
 		}
 
+		// The client initiated the close, so the reader may have already sent
+		// the reply close frame; in that case Close returns ErrConnClosed,
+		// which is expected here.
 		err = conn.Close(StatusOK, "OK")
-		if err != nil {
+		if err != nil && err != ErrConnClosed {
 			errorsInServer <- "Close: " + err.Error()
 		}
 
@@ -384,29 +387,32 @@ func TestInvalidCont(t *testing.T) {
 // TestTooLong tests that too long messages are correctly processed
 // on the server side.
 func TestTooLong(t *testing.T) {
-	var serverError string
+	serverError := make(chan string, 1)
 	server, err := StartTestServer(func(conn *Conn) {
 		// We send messages of 300 bytes length, but only provide a buffer of
 		// 150 bytes.  Make sure ErrTooLarge is reported.
 		buf := make([]byte, 150)
 		status := StatusOK
+		msg := ""
 		for {
 			n, err := conn.ReceiveBinary(buf)
 			if err == ErrConnClosed {
+				serverError <- msg
 				return
 			} else if err != ErrTooLarge {
-				serverError = "errTooLarge not reported"
+				msg = "errTooLarge not reported"
 				status = StatusProtocolError
 				break
 			}
 			err = conn.SendBinary(buf[:n])
 			if err != nil {
-				serverError = "server error: " + err.Error()
+				msg = "server error: " + err.Error()
 				status = StatusProtocolError
 				break
 			}
 		}
 		conn.Close(status, "")
+		serverError <- msg
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -419,7 +425,7 @@ func TestTooLong(t *testing.T) {
 	}
 
 	buf := make([]byte, 100)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		// Repeat the test, to make sure that the server drains the unread
 		// part of the message and does not hang.
 		err = client.BounceBinary(300, buf, binaryLengthCheck(150))
@@ -432,7 +438,49 @@ func TestTooLong(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if serverError != "" {
-		t.Error(serverError)
+	if msg := <-serverError; msg != "" {
+		t.Error(msg)
+	}
+}
+
+// TestReceiveTextReplacementChar makes sure that a text message which contains
+// a correctly-encoded Unicode replacement character (U+FFFD) is accepted.
+// U+FFFD is valid UTF-8, so it must not be mistaken for a decoding error.
+func TestReceiveTextReplacementChar(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	const msg = "hi � ok"
+
+	got := make(chan string, 1)
+	gotErr := make(chan error, 1)
+	handler := func(conn *Conn) {
+		s, err := conn.ReceiveText(64)
+		got <- s
+		gotErr <- err
+		conn.Close(StatusOK, "")
+	}
+
+	server, err := StartTestServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := server.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	err = client.SendFrame(Text, []byte(msg), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if e := <-gotErr; e != nil {
+		t.Fatalf("valid text containing U+FFFD was rejected: %v", e)
+	}
+	if s := <-got; s != msg {
+		t.Errorf("wrong text: %q != %q", s, msg)
 	}
 }

@@ -35,7 +35,7 @@ type Conn struct {
 	Origin       *url.URL
 	RemoteAddr   string
 	Protocol     string
-	RequestData  interface{} // as returned by Handler.AccessAllowed()
+	RequestData  any // as returned by Handler.AccessAllowed()
 
 	raw net.Conn
 
@@ -122,15 +122,10 @@ func (conn *Conn) Close(code Status, message string) error {
 		return ErrConnClosed
 	}
 
-	close(conn.senderStore) // prevent further writes
-	err := wb.sendCloseFrame(code, body)
-	if err != nil {
-		conn.raw.Close()
-		return ErrConnClosed
-	}
-
 	// Give the client 3 seconds to close the connection, before closing it
-	// from our end.
+	// from our end.  The timer is started before sending the close frame so
+	// that a flush which blocks on an unresponsive client is still forced to
+	// return (via raw.Close) after the timeout, rather than deadlocking.
 	go func() {
 		timeOut := time.NewTimer(3 * time.Second)
 		select {
@@ -142,6 +137,18 @@ func (conn *Conn) Close(code Status, message string) error {
 			conn.raw.Close() // force-stop the reader
 		}
 	}()
+
+	// Send our close frame before releasing the senderStore.  While we hold
+	// the token the reader is blocked on the (empty) senderStore and cannot
+	// close the raw connection out from under us; this guarantees the close
+	// frame is fully flushed before the reader can tear the connection down,
+	// which would otherwise truncate it and leave the client with an EOF.
+	err := wb.sendCloseFrame(code, body)
+	close(conn.senderStore) // prevent further writes
+	if err != nil {
+		conn.raw.Close()
+		return ErrConnClosed
+	}
 
 	return nil
 }

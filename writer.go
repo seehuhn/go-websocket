@@ -226,7 +226,7 @@ func doBroadcast(ctx context.Context, clients []*Conn, tp MessageType, msg []byt
 	}
 
 	disabled := reflect.Zero(reflect.ChanOf(reflect.BothDir,
-		reflect.TypeOf(&sender{})))
+		reflect.TypeFor[*sender]()))
 	todo := numClients
 	errors := make(map[int]error)
 mainLoop:
@@ -235,7 +235,7 @@ mainLoop:
 
 		if idx == numClients { // the context was cancelled
 			err := ctx.Err()
-			for i := 0; i < numClients; i++ {
+			for i := range numClients {
 				if cases[i].Chan != disabled {
 					errors[i] = err
 				}

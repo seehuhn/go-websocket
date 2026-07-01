@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -146,13 +147,7 @@ func (chat *Chat) Add(conn *websocket.Conn) {
 	name := strings.Join(parts[1:], " ")
 
 	chat.Lock()
-	alreadyPresent := false
-	for _, existing := range chat.members.names {
-		if name == existing {
-			alreadyPresent = true
-			break
-		}
-	}
+	alreadyPresent := slices.Contains(chat.members.names, name)
 	if !alreadyPresent {
 		chat.members.names = append(chat.members.names, name)
 		chat.members.conns = append(chat.members.conns, conn)

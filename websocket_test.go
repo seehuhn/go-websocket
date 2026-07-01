@@ -41,6 +41,7 @@ var (
 type TestServer struct {
 	addr     *net.UnixAddr
 	listener *net.UnixListener
+	done     chan struct{} // closed once the http.Serve goroutine has returned
 }
 
 // StartTestServer starts a websocket server which calls `handler`
@@ -65,7 +66,9 @@ func StartTestServer(handler func(*Conn)) (*TestServer, error) {
 	}
 
 	// start the websocket server
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		websocket := &Handler{
 			Handle: handler,
 		}
@@ -76,11 +79,16 @@ func StartTestServer(handler func(*Conn)) (*TestServer, error) {
 	return &TestServer{
 		addr:     addr,
 		listener: listener,
+		done:     done,
 	}, nil
 }
 
+// Close shuts the server down and waits for the http.Serve goroutine to exit,
+// so that no accept-loop goroutine lingers past the end of a test.
 func (server *TestServer) Close() error {
-	return server.listener.Close()
+	err := server.listener.Close()
+	<-server.done
+	return err
 }
 
 func (server *TestServer) Connect() (*TestClient, error) {
@@ -140,10 +148,7 @@ func (client *TestClient) Close() error {
 func (client *TestClient) Discard(n uint64) error {
 	const maxChunk = 1024 * 1024
 	for n > 0 {
-		chunk := n
-		if chunk > maxChunk {
-			chunk = maxChunk
-		}
+		chunk := min(n, maxChunk)
 		done, err := client.reader.Discard(int(chunk))
 		if err != nil {
 			return err
@@ -182,7 +187,7 @@ func (client *TestClient) MakeHeader(buf []byte, op MessageType, l uint64, final
 
 	// Being the client, we have to use a mask.  Just use the zero mask here.
 	buf[1] |= 128
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		buf[headerLength] = 0
 		headerLength++
 	}
@@ -309,10 +314,7 @@ func (client *TestClient) BounceBinary(length uint64, buffer []byte,
 	var sendErr error
 	var op MessageType = Binary
 	for {
-		nextChunk := todo
-		if nextChunk > maxChunk {
-			nextChunk = maxChunk
-		}
+		nextChunk := min(todo, maxChunk)
 
 		sendErr = client.SendNonsenseFrame(buffer, op, nextChunk, nextChunk == todo)
 		todo -= nextChunk
@@ -461,9 +463,9 @@ func TestBroadcast(t *testing.T) {
 func TestServerToClient(t *testing.T) {
 	const testMsg = "testing, testing, testing ..."
 
-	var sErr error
+	sErr := make(chan error, 1)
 	server, err := StartTestServer(func(c *Conn) {
-		sErr = c.SendText(testMsg)
+		sErr <- c.SendText(testMsg)
 		c.Close(StatusOK, "")
 	})
 	if err != nil {
@@ -475,6 +477,7 @@ func TestServerToClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer client.Close()
 
 	tp, msg, err := client.ReadFrame()
 	if err != nil {
@@ -487,8 +490,8 @@ func TestServerToClient(t *testing.T) {
 		t.Error("wrong message")
 	}
 
-	if sErr != nil {
-		t.Error("server error:", sErr)
+	if err := <-sErr; err != nil {
+		t.Error("server error:", err)
 	}
 }
 
@@ -514,6 +517,7 @@ func TestClientToServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer client.Close()
 
 	err = client.SendFrame(Text, []byte(testMsg), true)
 	if err != nil {
@@ -706,6 +710,7 @@ func TestKeepConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer server.Close()
 
 	client, err := server.Connect()
 	if err != nil {
@@ -740,7 +745,7 @@ func TestEchoMany(t *testing.T) {
 	defer client.Close()
 
 	buf := make([]byte, 16)
-	for i := 0; i < 1e6; i++ {
+	for range int(1e6) {
 		err = client.BounceBinary(16, buf, binaryLengthCheck(16))
 		if err != nil {
 			t.Fatal(err)

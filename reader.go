@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"reflect"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -38,6 +39,14 @@ type receiver struct {
 
 	connInfo        ConnInfo
 	shutdownStarted chan<- struct{}
+
+	// pongMu guards the pong bookkeeping below.  These fields are shared
+	// between the reader goroutine (via schedulePong) and at most one
+	// responder goroutine (pongResponder).
+	pongMu      sync.Mutex
+	pongPending []byte // payload of the most recent unanswered ping
+	havePong    bool   // whether pongPending holds a ping awaiting a pong
+	pongActive  bool   // whether a pongResponder goroutine is running
 }
 
 type readManagerData struct {
@@ -116,7 +125,10 @@ func (conn *Conn) readManager(data *readManagerData) {
 			closeStatus = StatusProtocolError
 		}
 
-		// TODO(voss): what to do in case of send errors?
+		// A send error here means the connection is already broken.  We
+		// deliberately drop it: we are in the middle of shutting the
+		// connection down and are about to close the raw connection anyway,
+		// so there is nothing useful left to do with the error.
 		wb.sendCloseFrame(closeStatus, nil)
 
 		if rb.connInfo == 0 {
@@ -189,27 +201,11 @@ func (rb *receiver) refill(isCont bool) error {
 			return ErrConnClosed
 
 		case pingFrame:
-			// TODO(voss): can we make this less ugly?
-			// TODO(voss): what to do if there is an error sending the pong?
+			// Copy the payload out of the shared scratch buffer, since the
+			// pong may be sent asynchronously after scratch has been reused.
 			body := make([]byte, rb.header.Length)
 			copy(body, rb.scratch[:rb.header.Length])
-			select {
-			case wb := <-rb.senderStore:
-				// If the sender is available, send the pong frame immediately.
-				if wb != nil {
-					wb.sendFrame(pongFrame, body, true)
-					rb.senderStore <- wb
-				}
-			default:
-				// Otherwise, send the pong frame in a separate goroutine.
-				go func() {
-					wb := <-rb.senderStore
-					if wb != nil {
-						wb.sendFrame(pongFrame, body, true)
-						rb.senderStore <- wb
-					}
-				}()
-			}
+			rb.schedulePong(body)
 
 		case pongFrame:
 			// we don't send ping frames and we ignore pong frames
@@ -218,6 +214,95 @@ func (rb *receiver) refill(isCont bool) error {
 			rb.failConnection(ProtocolViolation)
 			return ErrConnClosed
 		}
+	}
+}
+
+// schedulePong arranges for a pong frame with the given payload to be sent in
+// response to a ping.  If the sender is free, the pong is sent inline.
+// Otherwise the payload is handed to a single responder goroutine.
+//
+// Pings are coalesced: while a pong is still waiting to be sent, only the most
+// recently received payload is kept.  RFC 6455, section 5.5.3, explicitly
+// permits replying to only the most recently processed ping.  This bounds the
+// work per connection to one responder goroutine and one buffered payload, so
+// a flood of ping frames cannot exhaust resources.
+//
+// schedulePong is only ever called from the reader goroutine, so it never
+// races with itself; the mutex only guards against the responder goroutine.
+func (rb *receiver) schedulePong(body []byte) {
+	rb.pongMu.Lock()
+	if rb.pongActive {
+		// A responder is already running.  It re-checks havePong under the
+		// lock before it exits, so recording the ping here cannot lose it.
+		rb.pongPending = body
+		rb.havePong = true
+		rb.pongMu.Unlock()
+		return
+	}
+	rb.pongMu.Unlock()
+
+	// No responder is running.  If the sender happens to be free, answer
+	// inline without spawning a goroutine.
+	select {
+	case wb := <-rb.senderStore:
+		if wb != nil {
+			wb.sendFrame(pongFrame, body, true)
+			rb.senderStore <- wb
+		}
+		return
+	default:
+	}
+
+	// The sender is busy; start the single responder goroutine.
+	rb.pongMu.Lock()
+	rb.pongPending = body
+	rb.havePong = true
+	if !rb.pongActive {
+		rb.pongActive = true
+		go rb.pongResponder()
+	}
+	rb.pongMu.Unlock()
+}
+
+// pongResponder sends pong frames for pings that arrived while the sender was
+// busy.  At most one instance runs per connection at a time.  It keeps sending
+// the latest pending pong until no new ping has arrived, then exits.
+//
+// The "nothing pending" check and clearing pongActive happen under the same
+// lock that schedulePong uses to record a ping.  A ping recorded before the
+// check is answered by this goroutine; a ping recorded after the check sees
+// pongActive == false and starts a fresh responder.  There is no window in
+// which a ping is neither answered nor triggers a new responder.
+func (rb *receiver) pongResponder() {
+	for {
+		wb := <-rb.senderStore
+		if wb == nil {
+			// The connection is shutting down and the sender is gone.
+			rb.pongMu.Lock()
+			rb.pongActive = false
+			rb.pongMu.Unlock()
+			return
+		}
+
+		rb.pongMu.Lock()
+		body := rb.pongPending
+		have := rb.havePong
+		rb.pongPending = nil
+		rb.havePong = false
+		if !have {
+			rb.pongActive = false
+			rb.pongMu.Unlock()
+			rb.senderStore <- wb
+			return
+		}
+		rb.pongMu.Unlock()
+
+		// A send error means the connection is broken.  We deliberately drop
+		// it: the reader goroutine owns shutdown state and will fail the
+		// connection on its own next read.  This goroutine must not touch
+		// connInfo/shutdown.
+		wb.sendFrame(pongFrame, body, true)
+		rb.senderStore <- wb
 	}
 }
 
@@ -533,7 +618,7 @@ func (conn *Conn) doReceiveText(maxLength int, rb *receiver) (string, error) {
 	idx := 0
 	for idx < n {
 		r, size := utf8.DecodeRune(buf[idx:n])
-		if r == utf8.RuneError {
+		if r == utf8.RuneError && size == 1 {
 			if err == ErrTooLarge && idx > n-utf8.UTFMax && utf8.RuneStart(buf[idx]) {
 				// the last rune might be incomplete
 				n = idx

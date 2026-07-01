@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -43,7 +44,7 @@ type Handler struct {
 	// In addition, the function can return information from the request
 	// (e.g. login details extracted from cookies).  The returned value is
 	// stored in the [Conn.RequestData] field.
-	AccessAllowed func(r *http.Request) (bool, interface{})
+	AccessAllowed func(r *http.Request) (bool, any)
 
 	// Handle is called after the websocket handshake has completed
 	// successfully and the object conn can be used to send and
@@ -188,7 +189,7 @@ func (handler *Handler) handshake(w http.ResponseWriter, req *http.Request) (*Co
 	}
 
 	// access control
-	var requestData interface{}
+	var requestData any
 	if handler.AccessAllowed != nil {
 		ok, data := handler.AccessAllowed(req)
 		if !ok {
@@ -234,7 +235,7 @@ func (handler *Handler) chooseSubprotocol(req *http.Request) string {
 
 	var clientProtos []string
 	pp := strings.Split(req.Header.Get("Sec-Websocket-Protocol"), ",")
-	for i := 0; i < len(pp); i++ {
+	for i := range pp {
 		p := strings.TrimSpace(pp[i])
 		if p != "" {
 			clientProtos = append(clientProtos, p)
@@ -242,10 +243,8 @@ func (handler *Handler) chooseSubprotocol(req *http.Request) string {
 	}
 
 	for _, p := range serverProtos {
-		for _, q := range clientProtos {
-			if p == q {
-				return p
-			}
+		if slices.Contains(clientProtos, p) {
+			return p
 		}
 	}
 	return ""

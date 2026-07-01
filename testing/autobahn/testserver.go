@@ -55,7 +55,7 @@ func (tl *testList) String() string {
 }
 
 func (tl *testList) Set(value string) error {
-	for _, s := range strings.Split(value, ",") {
+	for s := range strings.SplitSeq(value, ",") {
 		s = strings.TrimSpace(s)
 		if s != "" {
 			*tl = append(*tl, s)
